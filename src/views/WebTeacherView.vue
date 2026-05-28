@@ -28,6 +28,9 @@ import {
   type WhiteboardSnapshotSyncMessage,
   type WhiteboardStudentBoardControlMessage,
   type WhiteboardStudentEventBatchMessage,
+  type WhiteboardTeacherStudentEventBatchMessage,
+  type WhiteboardTeacherStudentResyncRequestMessage,
+  type WhiteboardTeacherStudentSnapshotMessage,
   type WhiteboardStudentViewControlMessage,
   type WhiteboardSyncMessage,
 } from "../types/whiteboard";
@@ -65,6 +68,15 @@ const teacherWhiteboardSnapshot = ref<WhiteboardSnapshot>(
 );
 const studentBoardSnapshots = reactive(new Map<string, WhiteboardSnapshot>());
 const studentBoardLastSequence = reactive(new Map<string, number>());
+const teacherToStudentLastSequence = reactive(new Map<string, number>());
+const teacherToStudentNextSequence = reactive(new Map<string, number>());
+const queuedTeacherToStudentEvents = reactive(
+  new Map<string, WhiteboardIncrementalEvent[]>(),
+);
+const teacherToStudentBatchFlushTimers = new Map<string, number>();
+
+const coeditDialogVisible = ref(false);
+const coeditStudentId = ref<string | null>(null);
 
 const peers = new Map<string, RTCPeerConnection>();
 const pendingCandidates = new Map<string, RTCIceCandidateInit[]>();
@@ -103,6 +115,27 @@ const studentBoardTiles = computed(() => {
         studentBoardSnapshots.get(student.connection_id) ??
         createEmptyWhiteboardSnapshot(),
     }));
+});
+const coeditStudent = computed(() => {
+  if (!coeditStudentId.value) {
+    return null;
+  }
+
+  return (
+    students.value.find(
+      (student) => student.connection_id === coeditStudentId.value,
+    ) ?? null
+  );
+});
+const coeditStudentSnapshot = computed(() => {
+  if (!coeditStudentId.value) {
+    return createEmptyWhiteboardSnapshot();
+  }
+
+  return (
+    studentBoardSnapshots.get(coeditStudentId.value) ??
+    createEmptyWhiteboardSnapshot()
+  );
 });
 const studentGalleryRef = ref<HTMLDivElement | null>(null);
 const studentTileHeightPx = ref(240);
@@ -199,6 +232,21 @@ function toTeacherSnapshotMessage(
   };
 }
 
+function toTeacherStudentSnapshotMessage(
+  studentId: string,
+  reason: WhiteboardTeacherStudentSnapshotMessage["reason"],
+): WhiteboardTeacherStudentSnapshotMessage {
+  return {
+    kind: "teacher-student-snapshot",
+    boardTab: "student-board",
+    seq: teacherToStudentLastSequence.get(studentId) ?? 0,
+    reason,
+    snapshot: cloneWhiteboardSnapshot(
+      studentBoardSnapshots.get(studentId) ?? createEmptyWhiteboardSnapshot(),
+    ),
+  };
+}
+
 function toStudentBoardControlMessage(): WhiteboardStudentBoardControlMessage {
   return {
     kind: "student-board-control",
@@ -234,6 +282,40 @@ function toStudentViewControlMessage(): WhiteboardStudentViewControlMessage {
     kind: "student-view-control",
     forceTeacherBoardView: forceTeacherBoardView.value,
   };
+}
+
+function openStudentCoeditDialog(studentId: string) {
+  const student = students.value.find(
+    (item) => item.connection_id === studentId,
+  );
+  if (!student) {
+    showRtcError("目標學生已離線，無法開啟共編");
+    return;
+  }
+
+  coeditStudentId.value = studentId;
+  coeditDialogVisible.value = true;
+}
+
+function closeStudentCoeditDialog() {
+  coeditDialogVisible.value = false;
+  coeditStudentId.value = null;
+}
+
+function handleGlobalKeydown(event: KeyboardEvent) {
+  if (!coeditDialogVisible.value) {
+    return;
+  }
+
+  if (event.key === "Escape") {
+    closeStudentCoeditDialog();
+  }
+}
+
+function onCoeditDialogVisibilityChanged(value: boolean) {
+  if (!value) {
+    closeStudentCoeditDialog();
+  }
 }
 
 function normalizeValidUrl(urlInput: string): string | null {
@@ -280,6 +362,10 @@ function broadcastToLessonChannels(message: WhiteboardSyncMessage) {
 function pushBootstrapToStudent(studentId: string) {
   sendToStudentChannel(studentId, toModeMessage());
   sendToStudentChannel(studentId, toTeacherSnapshotMessage("join"));
+  sendToStudentChannel(
+    studentId,
+    toTeacherStudentSnapshotMessage(studentId, "join"),
+  );
   sendToStudentChannel(studentId, toStudentViewControlMessage());
 }
 
@@ -307,6 +393,31 @@ function flushQueuedTeacherEvents() {
   broadcastToLessonChannels(message);
 }
 
+function flushQueuedTeacherToStudentEvents(studentId: string) {
+  const queue = queuedTeacherToStudentEvents.get(studentId);
+  if (!queue || queue.length === 0) {
+    return;
+  }
+
+  const timer = teacherToStudentBatchFlushTimers.get(studentId);
+  if (typeof timer === "number") {
+    window.clearTimeout(timer);
+    teacherToStudentBatchFlushTimers.delete(studentId);
+  }
+
+  const events = queue.splice(0, queue.length);
+  const message: WhiteboardTeacherStudentEventBatchMessage = {
+    kind: "teacher-student-events-batch",
+    boardTab: "student-board",
+    startSeq: events[0].seq,
+    endSeq: events[events.length - 1].seq,
+    events,
+  };
+
+  teacherToStudentLastSequence.set(studentId, message.endSeq);
+  sendToStudentChannel(studentId, message);
+}
+
 function scheduleTeacherBatchFlush() {
   if (teacherBatchFlushTimer !== null) {
     return;
@@ -316,6 +427,19 @@ function scheduleTeacherBatchFlush() {
     teacherBatchFlushTimer = null;
     flushQueuedTeacherEvents();
   }, BATCH_INTERVAL_MS);
+}
+
+function scheduleTeacherToStudentBatchFlush(studentId: string) {
+  if (teacherToStudentBatchFlushTimers.has(studentId)) {
+    return;
+  }
+
+  const timer = window.setTimeout(() => {
+    teacherToStudentBatchFlushTimers.delete(studentId);
+    flushQueuedTeacherToStudentEvents(studentId);
+  }, BATCH_INTERVAL_MS);
+
+  teacherToStudentBatchFlushTimers.set(studentId, timer);
 }
 
 function enqueueTeacherIncrementalEvent(
@@ -334,6 +458,74 @@ function enqueueTeacherIncrementalEvent(
   }
 
   scheduleTeacherBatchFlush();
+}
+
+function applyTeacherEventToStudentSnapshot(
+  studentId: string,
+  payload: WhiteboardIncrementalEventPayload,
+) {
+  const baseSnapshot =
+    studentBoardSnapshots.get(studentId) ?? createEmptyWhiteboardSnapshot();
+  const nextSnapshot = cloneWhiteboardSnapshot(baseSnapshot);
+
+  applyIncrementalEvent(nextSnapshot, {
+    ...payload,
+    seq: -1,
+    timestamp: Date.now(),
+  });
+
+  setStudentSnapshot(studentId, nextSnapshot);
+}
+
+function enqueueTeacherToStudentIncrementalEvent(
+  studentId: string,
+  payload: WhiteboardIncrementalEventPayload,
+) {
+  const nextSeq = teacherToStudentNextSequence.get(studentId) ?? 1;
+  const queue = queuedTeacherToStudentEvents.get(studentId) ?? [];
+
+  queue.push({
+    ...payload,
+    seq: nextSeq,
+    timestamp: Date.now(),
+  });
+
+  queuedTeacherToStudentEvents.set(studentId, queue);
+  teacherToStudentNextSequence.set(studentId, nextSeq + 1);
+
+  if (queue.length >= BATCH_MAX_EVENTS) {
+    flushQueuedTeacherToStudentEvents(studentId);
+    return;
+  }
+
+  scheduleTeacherToStudentBatchFlush(studentId);
+}
+
+function handleCoeditStudentSnapshot(snapshot: WhiteboardSnapshot) {
+  const studentId = coeditStudentId.value;
+  if (!studentId) {
+    return;
+  }
+
+  setStudentSnapshot(studentId, snapshot);
+}
+
+function handleCoeditStudentSyncEvent(
+  payload: WhiteboardIncrementalEventPayload,
+) {
+  const studentId = coeditStudentId.value;
+  if (!studentId) {
+    return;
+  }
+
+  try {
+    applyTeacherEventToStudentSnapshot(studentId, payload);
+  } catch (error) {
+    showRtcError(`教師共編事件套用失敗: ${String(error)}`);
+    return;
+  }
+
+  enqueueTeacherToStudentIncrementalEvent(studentId, payload);
 }
 
 function applyFeatureMode(mode: WhiteboardMode) {
@@ -494,6 +686,9 @@ function resetStudentBoardState(studentId: string) {
   }
   setStudentSnapshot(studentId, emptySnapshot);
   studentBoardLastSequence.set(studentId, 0);
+  teacherToStudentLastSequence.set(studentId, 0);
+  teacherToStudentNextSequence.set(studentId, 1);
+  queuedTeacherToStudentEvents.set(studentId, []);
 }
 
 function processStudentBatch(
@@ -571,12 +766,34 @@ function handleChannelMessage(studentId: string, raw: string) {
 
     if (parsed.kind === "snapshot-request") {
       const request = parsed as WhiteboardSnapshotRequestMessage;
-      if (request.boardTab !== "teacher-board") {
+      if (request.boardTab === "teacher-board") {
+        const reason = request.reason === "join-init" ? "join" : "resync";
+        sendToStudentChannel(studentId, toTeacherSnapshotMessage(reason));
+        return;
+      }
+
+      if (request.boardTab === "student-board") {
+        const reason = request.reason === "join-init" ? "join" : "resync";
+        sendToStudentChannel(
+          studentId,
+          toTeacherStudentSnapshotMessage(studentId, reason),
+        );
+      }
+
+      return;
+    }
+
+    if (parsed.kind === "teacher-student-resync-request") {
+      const request = parsed as WhiteboardTeacherStudentResyncRequestMessage;
+      if (request.boardTab !== "student-board") {
         return;
       }
 
       const reason = request.reason === "join-init" ? "join" : "resync";
-      sendToStudentChannel(studentId, toTeacherSnapshotMessage(reason));
+      sendToStudentChannel(
+        studentId,
+        toTeacherStudentSnapshotMessage(studentId, reason),
+      );
       return;
     }
 
@@ -681,6 +898,12 @@ async function flushQueuedCandidates(studentId: string) {
 }
 
 function disposeStudentConnection(studentId: string) {
+  const teacherToStudentTimer = teacherToStudentBatchFlushTimers.get(studentId);
+  if (typeof teacherToStudentTimer === "number") {
+    window.clearTimeout(teacherToStudentTimer);
+    teacherToStudentBatchFlushTimers.delete(studentId);
+  }
+
   const peer = peers.get(studentId);
   if (peer) {
     peer.close();
@@ -696,6 +919,14 @@ function disposeStudentConnection(studentId: string) {
   pendingCandidates.delete(studentId);
   studentBoardSnapshots.delete(studentId);
   studentBoardLastSequence.delete(studentId);
+  teacherToStudentLastSequence.delete(studentId);
+  teacherToStudentNextSequence.delete(studentId);
+  queuedTeacherToStudentEvents.delete(studentId);
+
+  if (coeditStudentId.value === studentId) {
+    closeStudentCoeditDialog();
+    showRtcError(`學生 ${studentId} 已離線，共編已關閉`);
+  }
 }
 
 function reconcileStudentConnections(nextStudents: StudentSession[]) {
@@ -816,6 +1047,7 @@ watch(
 
 onMounted(() => {
   connectTeacherSocket();
+  window.addEventListener("keydown", handleGlobalKeydown);
 
   void nextTick(() => {
     recomputeStudentGalleryLayout();
@@ -835,6 +1067,13 @@ onBeforeUnmount(() => {
     teacherBatchFlushTimer = null;
   }
 
+  for (const timer of teacherToStudentBatchFlushTimers.values()) {
+    window.clearTimeout(timer);
+  }
+  teacherToStudentBatchFlushTimers.clear();
+
+  window.removeEventListener("keydown", handleGlobalKeydown);
+
   if (ws) {
     ws.close();
   }
@@ -848,6 +1087,9 @@ onBeforeUnmount(() => {
   pendingCandidates.clear();
   studentBoardSnapshots.clear();
   studentBoardLastSequence.clear();
+  teacherToStudentLastSequence.clear();
+  teacherToStudentNextSequence.clear();
+  queuedTeacherToStudentEvents.clear();
 
   if (studentGalleryResizeObserver) {
     studentGalleryResizeObserver.disconnect();
@@ -936,6 +1178,11 @@ onBeforeUnmount(() => {
                     v-for="tile in studentBoardTiles"
                     :key="tile.id"
                     class="student-gallery-item"
+                    role="button"
+                    tabindex="0"
+                    @click="openStudentCoeditDialog(tile.id)"
+                    @keydown.enter.prevent="openStudentCoeditDialog(tile.id)"
+                    @keydown.space.prevent="openStudentCoeditDialog(tile.id)"
                   >
                     <WhiteboardCanvas
                       :title="tile.nickname"
@@ -1053,6 +1300,37 @@ onBeforeUnmount(() => {
         </v-card-actions>
       </v-card>
     </v-dialog>
+
+    <v-dialog
+      v-model="coeditDialogVisible"
+      max-width="96vw"
+      width="96vw"
+      height="96vh"
+      max-height="96vh"
+      @update:model-value="onCoeditDialogVisibilityChanged"
+    >
+      <v-card rounded="lg" class="coedit-dialog-card">
+        <v-card-title
+          class="coedit-dialog-title d-flex align-center justify-space-between"
+        >
+          <span class="text-h6">學生白板共同編輯</span>
+          <v-btn
+            icon="mdi-close"
+            variant="text"
+            aria-label="關閉共編對話框"
+            @click="closeStudentCoeditDialog"
+          />
+        </v-card-title>
+        <v-card-text class="coedit-dialog-content">
+          <WhiteboardCanvas
+            :title="coeditStudent?.nickname ?? '學生白板'"
+            :snapshot="coeditStudentSnapshot"
+            @update:snapshot="handleCoeditStudentSnapshot"
+            @sync-event="handleCoeditStudentSyncEvent"
+          />
+        </v-card-text>
+      </v-card>
+    </v-dialog>
   </v-app>
 </template>
 
@@ -1102,11 +1380,40 @@ onBeforeUnmount(() => {
 .student-gallery-item {
   min-height: 0;
   height: 100%;
+  cursor: pointer;
+}
+
+.student-gallery-item:focus-visible {
+  outline: 2px solid rgb(var(--v-theme-primary));
+  outline-offset: 2px;
 }
 
 .image-tools-panel {
   height: 100%;
   overflow: auto;
+}
+
+.coedit-dialog-card {
+  height: 100%;
+  max-height: 100%;
+  display: flex;
+  flex-direction: column;
+}
+
+.coedit-dialog-content {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  padding: 8px;
+}
+
+.coedit-dialog-content :deep(.whiteboard-shell) {
+  flex: 1;
+  min-height: 0;
+}
+
+.coedit-dialog-title {
+  padding-block: 8px;
 }
 
 .teacher-student-list-card :deep(.v-card-title > span) {
@@ -1121,6 +1428,11 @@ onBeforeUnmount(() => {
 
   .image-tools-panel {
     height: auto;
+  }
+
+  .coedit-dialog-card {
+    height: 100%;
+    max-height: 100%;
   }
 }
 </style>

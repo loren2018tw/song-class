@@ -1,4 +1,8 @@
-## MODIFIED Requirements
+## Purpose
+
+定義課堂即時通道在教師端與學生端間的訊號交換、事件傳輸與重播一致性要求，確保白板同步在多人同時互動下仍可維持穩定與可重建。
+
+## Requirements
 
 ### Requirement: 系統必須提供教師端與學生端的即時訊號交換通道
 
@@ -32,8 +36,6 @@
 
 - **WHEN** signaling 訊息無法成功傳遞或目標端已離線
 - **THEN** 系統 MUST 回報失敗事件給發送端
-
-## ADDED Requirements
 
 ### Requirement: 教師端必須可重播並維護每位學生白板狀態
 

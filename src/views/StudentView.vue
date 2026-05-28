@@ -17,6 +17,9 @@ import {
   type WhiteboardSnapshot,
   type WhiteboardSnapshotRequestMessage,
   type WhiteboardStudentEventBatchMessage,
+  type WhiteboardTeacherStudentEventBatchMessage,
+  type WhiteboardTeacherStudentResyncRequestMessage,
+  type WhiteboardTeacherStudentSnapshotMessage,
   type WhiteboardSyncMessage,
 } from "../types/whiteboard";
 
@@ -45,6 +48,7 @@ const studentSnapshot = ref<WhiteboardSnapshot>(
   createEmptyWhiteboardSnapshot(),
 );
 let studentNextSequence = 1;
+const teacherStudentLastAppliedSequence = ref(0);
 const queuedStudentEvents: WhiteboardIncrementalEvent[] = [];
 let studentBatchFlushTimer: number | null = null;
 
@@ -85,6 +89,17 @@ function requestTeacherSnapshot(
     boardTab: "teacher-board",
     reason,
     sinceSeq: teacherLastAppliedSequence.value,
+  });
+}
+
+function requestTeacherStudentSnapshot(
+  reason: WhiteboardTeacherStudentResyncRequestMessage["reason"],
+) {
+  sendLessonMessage({
+    kind: "teacher-student-resync-request",
+    boardTab: "student-board",
+    reason,
+    sinceSeq: teacherStudentLastAppliedSequence.value,
   });
 }
 
@@ -177,6 +192,7 @@ function resetToJoinState(message = "連線已中斷，請重新加入") {
   teacherSnapshot.value = createEmptyWhiteboardSnapshot();
   studentSnapshot.value = createEmptyWhiteboardSnapshot();
   studentNextSequence = 1;
+  teacherStudentLastAppliedSequence.value = 0;
   queuedStudentEvents.length = 0;
   stopStudentBatchTimer();
   queuedIceCandidates.length = 0;
@@ -363,6 +379,37 @@ function applyTeacherBatch(message: WhiteboardEventBatchMessage) {
   teacherLastAppliedSequence.value = message.endSeq;
 }
 
+function applyTeacherStudentBatch(
+  message: WhiteboardTeacherStudentEventBatchMessage,
+) {
+  const expectedStart = teacherStudentLastAppliedSequence.value + 1;
+  if (message.startSeq !== expectedStart) {
+    requestTeacherStudentSnapshot("seq-gap");
+    return;
+  }
+
+  const nextSnapshot = cloneWhiteboardSnapshot(studentSnapshot.value);
+
+  try {
+    let expectedSeq = expectedStart;
+    for (const event of message.events) {
+      if (event.seq !== expectedSeq) {
+        requestTeacherStudentSnapshot("seq-gap");
+        return;
+      }
+
+      applyIncrementalEvent(nextSnapshot, event);
+      expectedSeq += 1;
+    }
+  } catch {
+    requestTeacherStudentSnapshot("seq-gap");
+    return;
+  }
+
+  studentSnapshot.value = nextSnapshot;
+  teacherStudentLastAppliedSequence.value = message.endSeq;
+}
+
 function openTeacherAssignedUrl(rawUrl: string) {
   const trimmed = rawUrl.trim();
   if (!trimmed) {
@@ -431,10 +478,19 @@ function handleLessonMessage(raw: string) {
 
     if (parsed.boardTab === "student-board") {
       studentSnapshot.value = cloneWhiteboardSnapshot(parsed.snapshot);
-      queuedStudentEvents.length = 0;
-      studentNextSequence = parsed.seq + 1;
       return;
     }
+  }
+
+  if (parsed.kind === "teacher-student-snapshot") {
+    const message = parsed as WhiteboardTeacherStudentSnapshotMessage;
+    if (message.boardTab !== "student-board") {
+      return;
+    }
+
+    studentSnapshot.value = cloneWhiteboardSnapshot(message.snapshot);
+    teacherStudentLastAppliedSequence.value = message.seq;
+    return;
   }
 
   if (parsed.kind === "whiteboard-events-batch") {
@@ -455,11 +511,22 @@ function handleLessonMessage(raw: string) {
     return;
   }
 
+  if (parsed.kind === "teacher-student-events-batch") {
+    const message = parsed as WhiteboardTeacherStudentEventBatchMessage;
+    if (message.boardTab !== "student-board") {
+      return;
+    }
+
+    applyTeacherStudentBatch(message);
+    return;
+  }
+
   if (parsed.kind === "student-board-control") {
     if (parsed.action === "clear-all") {
       stopStudentBatchTimer();
       queuedStudentEvents.length = 0;
       studentNextSequence = 1;
+      teacherStudentLastAppliedSequence.value = 0;
       studentSnapshot.value = {
         ...createEmptyWhiteboardSnapshot(),
         backgroundImage: studentSnapshot.value.backgroundImage ?? null,
@@ -512,6 +579,7 @@ function bindLessonChannel(channel: RTCDataChannel) {
     statusText.value = "已連線，請專心學習";
     signalError.value = "";
     requestTeacherSnapshot("join-init");
+    requestTeacherStudentSnapshot("join-init");
   };
 
   lessonChannel.onmessage = (event) => {

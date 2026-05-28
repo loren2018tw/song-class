@@ -1,4 +1,8 @@
-## MODIFIED Requirements
+## Purpose
+
+定義教師端白板模式入口、分頁切換與學生白板控制能力，確保課堂切換流程穩定且白板狀態可持續保留與恢復。
+
+## Requirements
 
 ### Requirement: 教師端必須提供小白板切換入口與主畫面配置
 
@@ -50,8 +54,6 @@
 - **THEN** 教師端 MUST 直接以既有白板快照恢復原畫面
 - **AND** 學生端 MUST 依既有快照恢復目前自行選擇分頁畫面
 - **AND** 教師端 MUST 不需重新傳送整份白板資料即可完成恢復
-
-## ADDED Requirements
 
 ### Requirement: 教師端學生白板控制本次僅支援全清除
 

@@ -461,14 +461,18 @@ function selectPenColor(color: WhiteboardColor) {
 }
 
 function selectBrushSize(size: number) {
-  currentTool.value = "pen";
   currentSize.value = size;
   brushSizeValue.value = size;
+
+  const tool = currentTool.value;
+  const emittedSize =
+    tool === "eraser" ? currentSize.value + 10 : currentSize.value;
+
   emitSyncEvent({
     type: "tool-change",
-    tool: "pen",
+    tool,
     color: currentColor.value,
-    size: currentSize.value,
+    size: emittedSize,
   });
   emitSnapshot();
 }
@@ -706,7 +710,10 @@ onBeforeUnmount(() => {
 
 .whiteboard-canvas--drawing {
   touch-action: none;
-  cursor: crosshair;
+  cursor:
+    url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='18' height='18' viewBox='0 0 18 18'%3E%3Ccircle cx='9' cy='9' r='5' fill='none' stroke='%23000000' stroke-width='1.5'/%3E%3Ccircle cx='9' cy='9' r='1.2' fill='%23000000'/%3E%3C/svg%3E")
+      9 9,
+    crosshair;
 }
 
 .whiteboard-canvas--readonly {

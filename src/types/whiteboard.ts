@@ -129,6 +129,29 @@ export interface WhiteboardStudentEventBatchMessage {
   events: WhiteboardIncrementalEvent[];
 }
 
+export interface WhiteboardTeacherStudentEventBatchMessage {
+  kind: "teacher-student-events-batch";
+  boardTab: "student-board";
+  startSeq: number;
+  endSeq: number;
+  events: WhiteboardIncrementalEvent[];
+}
+
+export interface WhiteboardTeacherStudentResyncRequestMessage {
+  kind: "teacher-student-resync-request";
+  boardTab: "student-board";
+  reason: "join-init" | "seq-gap";
+  sinceSeq: number;
+}
+
+export interface WhiteboardTeacherStudentSnapshotMessage {
+  kind: "teacher-student-snapshot";
+  boardTab: "student-board";
+  seq: number;
+  reason: "join" | "resync";
+  snapshot: WhiteboardSnapshot;
+}
+
 export interface WhiteboardStudentBoardControlMessage {
   kind: "student-board-control";
   action: "clear-all" | "replace-strokes" | "set-background";
@@ -153,6 +176,9 @@ export type WhiteboardSyncMessage =
   | WhiteboardEventBatchMessage
   | WhiteboardSnapshotRequestMessage
   | WhiteboardStudentEventBatchMessage
+  | WhiteboardTeacherStudentEventBatchMessage
+  | WhiteboardTeacherStudentResyncRequestMessage
+  | WhiteboardTeacherStudentSnapshotMessage
   | WhiteboardStudentBoardControlMessage
   | WhiteboardStudentViewControlMessage
   | WhiteboardStudentOpenUrlMessage;
@@ -196,6 +222,9 @@ export function isWhiteboardSyncMessage(
     kind === "whiteboard-events-batch" ||
     kind === "snapshot-request" ||
     kind === "student-events-batch" ||
+    kind === "teacher-student-events-batch" ||
+    kind === "teacher-student-resync-request" ||
+    kind === "teacher-student-snapshot" ||
     kind === "student-board-control" ||
     kind === "student-view-control" ||
     kind === "student-open-url"
