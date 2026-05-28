@@ -1,0 +1,40 @@
+## Purpose
+
+定義教師在控制台啟動課堂時，如何取得並管理可供學生連線的入口資訊，並能快速開啟瀏覽器教師端與辨識服務狀態。
+
+## Requirements
+
+### Requirement: 教師端必須提供學生可連線的入口資訊
+
+系統 MUST 在 Tauri 主控台啟動且服務就緒後，顯示可供學生連線的 URL、對應 IP 位址與可掃描的 QR Code。
+
+#### Scenario: 服務啟動後顯示入口資訊
+
+- **WHEN** 教師端啟動內建 Web Server 並進入可接受連線狀態
+- **THEN** Tauri 主控台 MUST 顯示至少一組可連線 URL 與其 IP 位址
+- **AND** 系統 MUST 產生與該 URL 一致的 QR Code 供學生掃描
+
+#### Scenario: 入口資訊變更時更新顯示
+
+- **WHEN** 系統偵測可用網路介面變更或服務綁定位址改變
+- **THEN** Tauri 主控台 MUST 更新 URL、IP 與 QR Code
+
+### Requirement: 主控台必須提供開啟瀏覽器教師端功能
+
+系統 MUST 在 Tauri 主控台提供「開啟教師端」操作，並使用作業系統預設瀏覽器開啟教師端頁面。
+
+#### Scenario: 教師按下開啟教師端按鈕
+
+- **WHEN** 教師在主控台點擊「開啟教師端」
+- **THEN** 系統 MUST 以作業系統預設瀏覽器開啟教師端 URL（例如 `/teacher`）
+- **AND** 開啟失敗時 MUST 顯示可理解的錯誤訊息
+
+### Requirement: 教師端必須顯示連線服務狀態
+
+系統 MUST 在 Tauri 主控台提供明確的服務狀態，包含未啟動、啟動中、可連線與錯誤狀態。
+
+#### Scenario: 服務初始化失敗
+
+- **WHEN** 內建服務啟動失敗
+- **THEN** Tauri 主控台 MUST 顯示錯誤狀態與可理解的失敗訊息
+- **AND** 系統 MUST 不顯示過期或不可用的連線資訊
