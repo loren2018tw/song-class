@@ -28,6 +28,7 @@ import {
   type WhiteboardSnapshotSyncMessage,
   type WhiteboardStudentBoardControlMessage,
   type WhiteboardStudentEventBatchMessage,
+  type WhiteboardStudentViewControlMessage,
   type WhiteboardSyncMessage,
 } from "../types/whiteboard";
 
@@ -39,8 +40,12 @@ const students = ref<StudentSession[]>([]);
 const wsStatus = ref("尚未連線");
 const rtcError = ref("");
 const rtcErrorVisible = ref(false);
+const openUrlDialogVisible = ref(false);
+const studentOpenUrlInput = ref("");
+const studentOpenUrlError = ref("");
 const activeFeature = ref<WhiteboardMode>("home");
 const activeWhiteboardTab = ref<WhiteboardBoardTab>("teacher-board");
+const forceTeacherBoardView = ref(false);
 const modeVersion = ref(0);
 const tabVersion = ref(0);
 
@@ -224,6 +229,34 @@ function toPushTeacherStrokesMessage(): WhiteboardStudentBoardControlMessage {
   };
 }
 
+function toStudentViewControlMessage(): WhiteboardStudentViewControlMessage {
+  return {
+    kind: "student-view-control",
+    forceTeacherBoardView: forceTeacherBoardView.value,
+  };
+}
+
+function normalizeValidUrl(urlInput: string): string | null {
+  const trimmed = urlInput.trim();
+  if (!trimmed) {
+    return null;
+  }
+
+  try {
+    const parsed = new URL(trimmed);
+    const isHttpProtocol =
+      parsed.protocol === "http:" || parsed.protocol === "https:";
+
+    if (!isHttpProtocol) {
+      return null;
+    }
+
+    return parsed.toString();
+  } catch {
+    return null;
+  }
+}
+
 function sendToStudentChannel(
   studentId: string,
   message: WhiteboardSyncMessage,
@@ -247,6 +280,7 @@ function broadcastToLessonChannels(message: WhiteboardSyncMessage) {
 function pushBootstrapToStudent(studentId: string) {
   sendToStudentChannel(studentId, toModeMessage());
   sendToStudentChannel(studentId, toTeacherSnapshotMessage("join"));
+  sendToStudentChannel(studentId, toStudentViewControlMessage());
 }
 
 function flushQueuedTeacherEvents() {
@@ -330,6 +364,10 @@ function onWhiteboardTabChanged(tab: unknown) {
 }
 
 function activateHome() {
+  if (forceTeacherBoardView.value) {
+    forceTeacherBoardView.value = false;
+    broadcastToLessonChannels(toStudentViewControlMessage());
+  }
   applyFeatureMode("home");
 }
 
@@ -343,6 +381,43 @@ function activateTeacherBoardTab() {
 
 function activateStudentBoardTab() {
   applyWhiteboardTab("student-board");
+}
+
+function onForceTeacherBoardViewChanged(value: boolean | null) {
+  forceTeacherBoardView.value = value === true;
+
+  if (forceTeacherBoardView.value) {
+    applyFeatureMode("whiteboard");
+    applyWhiteboardTab("teacher-board");
+  }
+
+  broadcastToLessonChannels(toStudentViewControlMessage());
+}
+
+function openStudentUrlDialog() {
+  studentOpenUrlInput.value = "";
+  studentOpenUrlError.value = "";
+  openUrlDialogVisible.value = true;
+}
+
+function closeStudentUrlDialog() {
+  openUrlDialogVisible.value = false;
+  studentOpenUrlError.value = "";
+}
+
+function submitOpenStudentUrlCommand() {
+  const validUrl = normalizeValidUrl(studentOpenUrlInput.value);
+  if (!validUrl) {
+    studentOpenUrlError.value = "請輸入有效網址（需為 http 或 https）";
+    return;
+  }
+
+  broadcastToLessonChannels({
+    kind: "student-open-url",
+    url: validUrl,
+  });
+
+  closeStudentUrlDialog();
 }
 
 function handleTeacherWhiteboardSnapshot(snapshot: WhiteboardSnapshot) {
@@ -784,7 +859,7 @@ onBeforeUnmount(() => {
 <template>
   <v-app>
     <v-app-bar title="song-class(教師端)"></v-app-bar>
-    <v-navigation-drawer :width="255">
+    <v-navigation-drawer :width="200">
       <div>
         <p class="text-medium-emphasis mb-0">WebSocket: {{ wsStatus }}</p>
       </div>
@@ -803,9 +878,16 @@ onBeforeUnmount(() => {
         >
           小白版
         </v-btn>
+        <v-btn color="info" variant="tonal" @click="openStudentUrlDialog">
+          學生開啟網頁
+        </v-btn>
       </div>
       <div class="ma-2">
-        <StudentListCard title="已連入學生" :students="students" />
+        <StudentListCard
+          class="teacher-student-list-card"
+          title="已連入學生"
+          :students="students"
+        />
       </div>
     </v-navigation-drawer>
     <v-main class="teacher-main">
@@ -869,10 +951,12 @@ onBeforeUnmount(() => {
           <v-card rounded="lg" variant="outlined" class="image-tools-panel">
             <v-card-text class="d-flex flex-column ga-3">
               <v-switch
+                v-model="forceTeacherBoardView"
                 color="success"
                 density="compact"
                 hide-details
-                label="鎖定學生白板"
+                label="強制觀看教師白板"
+                @update:model-value="onForceTeacherBoardViewChanged"
               />
 
               <v-btn
@@ -945,6 +1029,30 @@ onBeforeUnmount(() => {
         <v-btn variant="text" @click="rtcErrorVisible = false">關閉</v-btn>
       </template>
     </v-snackbar>
+
+    <v-dialog v-model="openUrlDialogVisible" max-width="520">
+      <v-card rounded="lg">
+        <v-card-title class="text-h6">通知學生開啟網頁</v-card-title>
+        <v-card-text>
+          <v-text-field
+            v-model="studentOpenUrlInput"
+            label="網址"
+            placeholder="https://example.com"
+            variant="outlined"
+            density="comfortable"
+            :error-messages="studentOpenUrlError"
+            @update:model-value="studentOpenUrlError = ''"
+            @keydown.enter="submitOpenStudentUrlCommand"
+          />
+        </v-card-text>
+        <v-card-actions class="justify-end">
+          <v-btn variant="text" @click="closeStudentUrlDialog">取消</v-btn>
+          <v-btn color="primary" @click="submitOpenStudentUrlCommand"
+            >確定</v-btn
+          >
+        </v-card-actions>
+      </v-card>
+    </v-dialog>
   </v-app>
 </template>
 
@@ -999,6 +1107,10 @@ onBeforeUnmount(() => {
 .image-tools-panel {
   height: 100%;
   overflow: auto;
+}
+
+.teacher-student-list-card :deep(.v-card-title > span) {
+  font-size: 0.95rem;
 }
 
 @media (max-width: 960px) {

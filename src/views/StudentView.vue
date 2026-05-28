@@ -32,6 +32,7 @@ const isConnected = ref(false);
 const signalError = ref("");
 const activeMode = ref<WhiteboardMode>("home");
 const activeTab = ref<WhiteboardBoardTab>("teacher-board");
+const isTeacherBoardViewForced = ref(false);
 const modeVersion = ref(0);
 const tabVersion = ref(0);
 
@@ -151,6 +152,11 @@ function enqueueStudentEvent(payload: WhiteboardIncrementalEventPayload) {
 }
 
 function onStudentTabChanged(tab: unknown) {
+  if (isTeacherBoardViewForced.value) {
+    activeTab.value = "teacher-board";
+    return;
+  }
+
   if (tab !== "teacher-board" && tab !== "student-board") {
     return;
   }
@@ -164,6 +170,7 @@ function resetToJoinState(message = "連線已中斷，請重新加入") {
   selfId = undefined;
   activeMode.value = "home";
   activeTab.value = "teacher-board";
+  isTeacherBoardViewForced.value = false;
   modeVersion.value = 0;
   tabVersion.value = 0;
   teacherLastAppliedSequence.value = 0;
@@ -356,6 +363,34 @@ function applyTeacherBatch(message: WhiteboardEventBatchMessage) {
   teacherLastAppliedSequence.value = message.endSeq;
 }
 
+function openTeacherAssignedUrl(rawUrl: string) {
+  const trimmed = rawUrl.trim();
+  if (!trimmed) {
+    signalError.value = "教師傳送了無效網址";
+    return;
+  }
+
+  let parsed: URL;
+  try {
+    parsed = new URL(trimmed);
+  } catch {
+    signalError.value = "教師傳送了無效網址";
+    return;
+  }
+
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+    signalError.value = "教師傳送了不支援的網址協定";
+    return;
+  }
+
+  signalError.value = "";
+  try {
+    window.open(parsed.toString(), "_blank", "noopener,noreferrer");
+  } catch {
+    signalError.value = "無法開啟新分頁，請允許瀏覽器彈出視窗";
+  }
+}
+
 function handleLessonMessage(raw: string) {
   const parsed = JSON.parse(raw) as unknown;
   if (!isWhiteboardSyncMessage(parsed)) {
@@ -449,6 +484,23 @@ function handleLessonMessage(raw: string) {
         strokes: nextStrokes,
       };
     }
+
+    return;
+  }
+
+  if (parsed.kind === "student-view-control") {
+    isTeacherBoardViewForced.value = parsed.forceTeacherBoardView;
+
+    if (parsed.forceTeacherBoardView) {
+      activeMode.value = "whiteboard";
+      activeTab.value = "teacher-board";
+    }
+
+    return;
+  }
+
+  if (parsed.kind === "student-open-url") {
+    openTeacherAssignedUrl(parsed.url);
   }
 }
 
@@ -584,6 +636,7 @@ onBeforeUnmount(() => {
     <v-tabs
       color="primary"
       density="compact"
+      :disabled="isTeacherBoardViewForced"
       :model-value="activeTab"
       @update:model-value="onStudentTabChanged"
     >

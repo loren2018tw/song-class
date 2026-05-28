@@ -137,13 +137,25 @@ export interface WhiteboardStudentBoardControlMessage {
   backgroundImage?: string | null;
 }
 
+export interface WhiteboardStudentViewControlMessage {
+  kind: "student-view-control";
+  forceTeacherBoardView: boolean;
+}
+
+export interface WhiteboardStudentOpenUrlMessage {
+  kind: "student-open-url";
+  url: string;
+}
+
 export type WhiteboardSyncMessage =
   | WhiteboardModeSyncMessage
   | WhiteboardSnapshotSyncMessage
   | WhiteboardEventBatchMessage
   | WhiteboardSnapshotRequestMessage
   | WhiteboardStudentEventBatchMessage
-  | WhiteboardStudentBoardControlMessage;
+  | WhiteboardStudentBoardControlMessage
+  | WhiteboardStudentViewControlMessage
+  | WhiteboardStudentOpenUrlMessage;
 
 export function cloneWhiteboardStroke(
   stroke: WhiteboardStroke,
@@ -184,7 +196,9 @@ export function isWhiteboardSyncMessage(
     kind === "whiteboard-events-batch" ||
     kind === "snapshot-request" ||
     kind === "student-events-batch" ||
-    kind === "student-board-control"
+    kind === "student-board-control" ||
+    kind === "student-view-control" ||
+    kind === "student-open-url"
   );
 }
 
