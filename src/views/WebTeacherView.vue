@@ -17,6 +17,19 @@ const students = ref<StudentSession[]>([]);
 const wsStatus = ref("尚未連線");
 const rtcError = ref("");
 const activeFeature = ref<"students" | "whiteboard">("students");
+
+// 小白板背景圖片清單，方便手動調整檔名與顯示名稱。
+const whiteboardBackgroundOptions = [
+  { fileName: null, displayName: "空白" },
+  { fileName: "SixThinkingHats.png", displayName: "六頂思考帽" },
+  { fileName: "english.png", displayName: "英文練習簿" },
+  { fileName: "national-character.png", displayName: "生字練習" },
+  { fileName: "staff.png", displayName: "五線譜" },
+] as const;
+
+const teacherBackground = ref<string | null>(null);
+const studentBackground = ref<string | null>(null);
+
 const whiteboardSnapshot = ref<WhiteboardSnapshot>(
   createEmptyWhiteboardSnapshot(),
 );
@@ -31,6 +44,15 @@ const wsUrl = computed(() => {
   base.pathname = "/ws";
   base.search = "?role=teacher";
   return base.toString();
+});
+
+const teacherBackgroundImage = computed(() => {
+  if (!teacherBackground.value) {
+    return null;
+  }
+
+  return new URL(`../assets/bg/${teacherBackground.value}`, import.meta.url)
+    .href;
 });
 
 function sendSignal(payload: SignalEnvelope) {
@@ -205,11 +227,52 @@ onBeforeUnmount(() => {
     </v-navigation-drawer>
     <v-main class="teacher-main">
       <div class="feature-main pa-3">
-        <WhiteboardCanvas
-          v-if="activeFeature === 'whiteboard'"
-          :snapshot="whiteboardSnapshot"
-          @update:snapshot="handleWhiteboardSnapshot"
-        />
+        <div v-if="activeFeature === 'whiteboard'" class="whiteboard-layout">
+          <div class="whiteboard-canvas-wrap">
+            <WhiteboardCanvas
+              :snapshot="whiteboardSnapshot"
+              :background-image="teacherBackgroundImage"
+              @update:snapshot="handleWhiteboardSnapshot"
+            />
+          </div>
+
+          <v-card rounded="lg" variant="outlined" class="image-tools-panel">
+            <v-card-text class="d-flex flex-column ga-3">
+              <v-switch
+                color="success"
+                density="compact"
+                hide-details
+                label="鎖定學生白板"
+              />
+              <v-btn color="error" variant="tonal" block>清除學生白板</v-btn>
+              <v-btn color="primary" variant="tonal" block>推送教師白板</v-btn>
+
+              <v-select
+                v-model="teacherBackground"
+                label="教師背景"
+                :items="whiteboardBackgroundOptions"
+                item-title="displayName"
+                item-value="fileName"
+                density="compact"
+                variant="outlined"
+                hide-details
+              />
+
+              <v-select
+                v-model="studentBackground"
+                label="學生背景"
+                :items="whiteboardBackgroundOptions"
+                item-title="displayName"
+                item-value="fileName"
+                density="compact"
+                variant="outlined"
+                hide-details
+              />
+
+              <v-btn color="success" variant="tonal" block>下載學生白板</v-btn>
+            </v-card-text>
+          </v-card>
+        </div>
 
         <v-card
           v-else
@@ -235,5 +298,35 @@ onBeforeUnmount(() => {
 .feature-main {
   height: 100%;
   min-height: 0;
+}
+
+.whiteboard-layout {
+  height: 100%;
+  min-height: 0;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 230px;
+  gap: 12px;
+}
+
+.whiteboard-canvas-wrap {
+  min-width: 0;
+  min-height: 0;
+  height: 100%;
+}
+
+.image-tools-panel {
+  height: 100%;
+  overflow: auto;
+}
+
+@media (max-width: 960px) {
+  .whiteboard-layout {
+    grid-template-columns: 1fr;
+    grid-template-rows: minmax(0, 1fr) auto;
+  }
+
+  .image-tools-panel {
+    height: auto;
+  }
 }
 </style>

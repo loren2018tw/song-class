@@ -31,6 +31,7 @@ export interface WhiteboardSnapshot {
   version: 1;
   canvasWidth: number;
   canvasHeight: number;
+  backgroundImage: string | null;
   backgroundColor: string;
   strokes: WhiteboardStroke[];
 }
@@ -40,6 +41,7 @@ export function createEmptyWhiteboardSnapshot(): WhiteboardSnapshot {
     version: 1,
     canvasWidth: WHITEBOARD_CANVAS_WIDTH,
     canvasHeight: WHITEBOARD_CANVAS_HEIGHT,
+    backgroundImage: null,
     backgroundColor: WHITEBOARD_BACKGROUND_COLOR,
     strokes: [],
   };

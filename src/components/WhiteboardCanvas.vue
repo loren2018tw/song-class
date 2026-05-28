@@ -2,7 +2,6 @@
 import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import {
   createEmptyWhiteboardSnapshot,
-  WHITEBOARD_BACKGROUND_COLOR,
   WHITEBOARD_CANVAS_HEIGHT,
   WHITEBOARD_CANVAS_WIDTH,
   WHITEBOARD_COLOR_OPTIONS,
@@ -13,16 +12,23 @@ import {
   type WhiteboardColor,
 } from "../types/whiteboard";
 
-const props = defineProps<{
-  title?: string;
-  snapshot?: WhiteboardSnapshot | null;
-}>();
+const props = withDefaults(
+  defineProps<{
+    title?: string;
+    snapshot?: WhiteboardSnapshot | null;
+    backgroundImage?: string | null;
+  }>(),
+  {
+    title: "",
+  },
+);
 
 const emit = defineEmits<{
   (event: "update:snapshot", snapshot: WhiteboardSnapshot): void;
 }>();
 
-const canvasRef = ref<HTMLCanvasElement | null>(null);
+const drawingCanvasRef = ref<HTMLCanvasElement | null>(null);
+const backgroundCanvasRef = ref<HTMLCanvasElement | null>(null);
 const canvasWrapperRef = ref<HTMLDivElement | null>(null);
 const currentSnapshot = ref<WhiteboardSnapshot>(
   createEmptyWhiteboardSnapshot(),
@@ -37,6 +43,7 @@ const isDrawing = ref(false);
 const activeStroke = ref<WhiteboardStroke | null>(null);
 let strokeSequence = 0;
 let resizeObserver: ResizeObserver | null = null;
+let backgroundRenderSequence = 0;
 
 const MIN_STAGE_WIDTH = 640;
 const MIN_STAGE_HEIGHT = 360;
@@ -96,6 +103,7 @@ function cloneSnapshot(snapshot: WhiteboardSnapshot): WhiteboardSnapshot {
     version: snapshot.version,
     canvasWidth: snapshot.canvasWidth,
     canvasHeight: snapshot.canvasHeight,
+    backgroundImage: snapshot.backgroundImage ?? null,
     backgroundColor: snapshot.backgroundColor,
     strokes: snapshot.strokes.map((stroke) => ({
       id: stroke.id,
@@ -108,8 +116,7 @@ function cloneSnapshot(snapshot: WhiteboardSnapshot): WhiteboardSnapshot {
 }
 
 function createStroke(tool: WhiteboardTool): WhiteboardStroke {
-  const resolvedColor =
-    tool === "eraser" ? WHITEBOARD_BACKGROUND_COLOR : currentColor.value;
+  const resolvedColor = currentColor.value;
   const resolvedSize =
     tool === "eraser" ? currentSize.value + 10 : currentSize.value;
 
@@ -122,8 +129,7 @@ function createStroke(tool: WhiteboardTool): WhiteboardStroke {
   };
 }
 
-function getCanvasContext() {
-  const canvasElement = canvasRef.value;
+function getCanvasContext(canvasElement: HTMLCanvasElement | null) {
   if (!canvasElement) {
     return null;
   }
@@ -138,12 +144,30 @@ function getCanvasContext() {
   return context;
 }
 
-function fillBackground(context: CanvasRenderingContext2D) {
-  context.save();
-  context.setTransform(1, 0, 0, 1, 0, 0);
-  context.fillStyle = currentSnapshot.value.backgroundColor;
-  context.fillRect(0, 0, WHITEBOARD_CANVAS_WIDTH, WHITEBOARD_CANVAS_HEIGHT);
-  context.restore();
+function resolveBackgroundImageSource(imagePath: string | null | undefined) {
+  if (!imagePath) {
+    return null;
+  }
+
+  const trimmed = imagePath.trim();
+  if (!trimmed) {
+    return null;
+  }
+
+  return trimmed;
+}
+
+function loadImage(src: string) {
+  return new Promise<HTMLImageElement>((resolve, reject) => {
+    const image = new Image();
+    image.onload = () => {
+      resolve(image);
+    };
+    image.onerror = () => {
+      reject(new Error(`背景圖片載入失敗: ${src}`));
+    };
+    image.src = src;
+  });
 }
 
 function drawStroke(
@@ -155,6 +179,8 @@ function drawStroke(
   }
 
   context.save();
+  context.globalCompositeOperation =
+    stroke.tool === "eraser" ? "destination-out" : "source-over";
   context.strokeStyle = stroke.color;
   context.fillStyle = stroke.color;
   context.lineWidth = stroke.size;
@@ -178,29 +204,106 @@ function drawStroke(
   context.restore();
 }
 
-function redrawCanvas() {
-  const context = getCanvasContext();
+function redrawDrawingCanvas() {
+  const context = getCanvasContext(drawingCanvasRef.value);
   if (!context) {
     return;
   }
 
-  fillBackground(context);
+  context.clearRect(0, 0, WHITEBOARD_CANVAS_WIDTH, WHITEBOARD_CANVAS_HEIGHT);
   for (const stroke of currentSnapshot.value.strokes) {
     drawStroke(context, stroke);
   }
+}
+
+async function redrawBackgroundCanvas() {
+  const context = getCanvasContext(backgroundCanvasRef.value);
+  if (!context) {
+    return;
+  }
+
+  const currentRender = ++backgroundRenderSequence;
+  context.clearRect(0, 0, WHITEBOARD_CANVAS_WIDTH, WHITEBOARD_CANVAS_HEIGHT);
+
+  const fallbackColor = currentSnapshot.value.backgroundColor;
+  if (fallbackColor) {
+    context.fillStyle = fallbackColor;
+    context.fillRect(0, 0, WHITEBOARD_CANVAS_WIDTH, WHITEBOARD_CANVAS_HEIGHT);
+  }
+
+  const backgroundSource = resolveBackgroundImageSource(
+    currentSnapshot.value.backgroundImage,
+  );
+
+  if (!backgroundSource) {
+    return;
+  }
+
+  try {
+    const image = await loadImage(backgroundSource);
+    if (currentRender !== backgroundRenderSequence) {
+      return;
+    }
+    context.drawImage(
+      image,
+      0,
+      0,
+      WHITEBOARD_CANVAS_WIDTH,
+      WHITEBOARD_CANVAS_HEIGHT,
+    );
+  } catch (error) {
+    console.warn(String(error));
+  }
+}
+
+function redrawAll() {
+  void redrawBackgroundCanvas();
+  redrawDrawingCanvas();
 }
 
 function emitSnapshot() {
   emit("update:snapshot", cloneSnapshot(currentSnapshot.value));
 }
 
+function hasBackgroundChanged(
+  previousSnapshot: WhiteboardSnapshot,
+  nextSnapshot: WhiteboardSnapshot,
+) {
+  return (
+    (previousSnapshot.backgroundImage ?? null) !==
+      (nextSnapshot.backgroundImage ?? null) ||
+    previousSnapshot.backgroundColor !== nextSnapshot.backgroundColor
+  );
+}
+
 function syncLocalStateFromSnapshot(snapshot: WhiteboardSnapshot) {
-  currentSnapshot.value = cloneSnapshot(snapshot);
-  redrawCanvas();
+  const previousSnapshot = currentSnapshot.value;
+  const cloned = cloneSnapshot(snapshot);
+  currentSnapshot.value = {
+    ...cloned,
+    backgroundImage: cloned.backgroundImage ?? null,
+  };
+
+  if (hasBackgroundChanged(previousSnapshot, currentSnapshot.value)) {
+    void redrawBackgroundCanvas();
+  }
+  redrawDrawingCanvas();
+}
+
+function updateBackgroundImage(
+  imagePath: string | null | undefined,
+  shouldEmit: boolean,
+) {
+  currentSnapshot.value.backgroundImage =
+    resolveBackgroundImageSource(imagePath);
+  void redrawBackgroundCanvas();
+  if (shouldEmit) {
+    emitSnapshot();
+  }
 }
 
 function toCanvasPoint(event: PointerEvent): WhiteboardPoint | null {
-  const canvasElement = canvasRef.value;
+  const canvasElement = drawingCanvasRef.value;
   if (!canvasElement) {
     return null;
   }
@@ -228,7 +331,7 @@ function appendPoint(point: WhiteboardPoint) {
   }
 
   stroke.points.push(point);
-  redrawCanvas();
+  redrawDrawingCanvas();
 }
 
 function beginDrawing(event: PointerEvent) {
@@ -237,17 +340,23 @@ function beginDrawing(event: PointerEvent) {
     return;
   }
 
-  const canvasElement = canvasRef.value;
+  const canvasElement = drawingCanvasRef.value;
   if (!canvasElement) {
     return;
   }
 
-  canvasElement.setPointerCapture(event.pointerId);
+  if (event.isPrimary) {
+    try {
+      canvasElement.setPointerCapture(event.pointerId);
+    } catch {
+      // 某些非原生觸發的事件沒有可捕捉 pointer，忽略即可。
+    }
+  }
   isDrawing.value = true;
   activeStroke.value = createStroke(currentTool.value);
   activeStroke.value.points.push(point);
   currentSnapshot.value.strokes.push(activeStroke.value);
-  redrawCanvas();
+  redrawDrawingCanvas();
 }
 
 function continueDrawing(event: PointerEvent) {
@@ -264,9 +373,15 @@ function continueDrawing(event: PointerEvent) {
 }
 
 function endDrawing(event: PointerEvent) {
-  const canvasElement = canvasRef.value;
-  if (canvasElement && canvasElement.hasPointerCapture(event.pointerId)) {
-    canvasElement.releasePointerCapture(event.pointerId);
+  const canvasElement = drawingCanvasRef.value;
+  if (canvasElement && event.isPrimary) {
+    try {
+      if (canvasElement.hasPointerCapture(event.pointerId)) {
+        canvasElement.releasePointerCapture(event.pointerId);
+      }
+    } catch {
+      // 同 beginDrawing，遇到無效 pointer id 時安全忽略。
+    }
   }
 
   if (!isDrawing.value) {
@@ -302,10 +417,13 @@ function activateEraser() {
 }
 
 function clearCanvas() {
-  currentSnapshot.value = createEmptyWhiteboardSnapshot();
+  currentSnapshot.value = {
+    ...createEmptyWhiteboardSnapshot(),
+    backgroundImage: currentSnapshot.value.backgroundImage ?? null,
+  };
   activeStroke.value = null;
   isDrawing.value = false;
-  redrawCanvas();
+  redrawDrawingCanvas();
   emitSnapshot();
 }
 
@@ -313,12 +431,26 @@ watch(
   () => props.snapshot,
   (snapshot) => {
     if (!snapshot) {
-      currentSnapshot.value = createEmptyWhiteboardSnapshot();
-      redrawCanvas();
+      currentSnapshot.value = {
+        ...createEmptyWhiteboardSnapshot(),
+        backgroundImage: resolveBackgroundImageSource(props.backgroundImage),
+      };
+      redrawAll();
       return;
     }
 
     syncLocalStateFromSnapshot(snapshot);
+  },
+  { immediate: true },
+);
+
+watch(
+  () => props.backgroundImage,
+  (backgroundImage) => {
+    if (backgroundImage === undefined) {
+      return;
+    }
+    updateBackgroundImage(backgroundImage, true);
   },
   { immediate: true },
 );
@@ -332,7 +464,7 @@ onMounted(() => {
     resizeObserver.observe(canvasWrapperRef.value);
   }
   window.addEventListener("resize", calculateStageSize);
-  redrawCanvas();
+  redrawAll();
 });
 
 onBeforeUnmount(() => {
@@ -351,6 +483,16 @@ onBeforeUnmount(() => {
       <div
         class="toolbar-wrap d-flex flex-wrap ga-3 align-center justify-center"
       >
+        <v-chip
+          v-if="props.title"
+          color="primary"
+          variant="tonal"
+          size="small"
+          class="title-chip mr-10"
+        >
+          {{ props.title }}
+        </v-chip>
+
         <div class="d-flex flex-wrap ga-2">
           <v-btn
             v-for="color in WHITEBOARD_COLOR_OPTIONS"
@@ -404,8 +546,15 @@ onBeforeUnmount(() => {
       <div ref="canvasWrapperRef" class="whiteboard-stage-host">
         <div class="whiteboard-stage" :style="stageStyle">
           <canvas
-            ref="canvasRef"
-            class="whiteboard-canvas"
+            ref="backgroundCanvasRef"
+            class="whiteboard-canvas whiteboard-canvas--background"
+            width="1280"
+            height="720"
+            aria-hidden="true"
+          />
+          <canvas
+            ref="drawingCanvasRef"
+            class="whiteboard-canvas whiteboard-canvas--drawing"
             width="1280"
             height="720"
             @pointerdown.prevent="beginDrawing"
@@ -446,6 +595,7 @@ onBeforeUnmount(() => {
 }
 
 .whiteboard-stage {
+  position: relative;
   border-radius: 20px;
   overflow: hidden;
   border: 1px solid rgba(33, 33, 33, 0.12);
@@ -453,16 +603,28 @@ onBeforeUnmount(() => {
 }
 
 .whiteboard-canvas {
+  position: absolute;
+  inset: 0;
   width: 100%;
   height: 100%;
   display: block;
+}
+
+.whiteboard-canvas--background {
+  pointer-events: none;
+}
+
+.whiteboard-canvas--drawing {
   touch-action: none;
   cursor: crosshair;
-  background: #ffffff;
 }
 
 .toolbar-wrap {
   width: 100%;
+}
+
+.title-chip {
+  font-weight: 700;
 }
 
 .brush-slider {
