@@ -1,15 +1,19 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import {
+  cloneWhiteboardSnapshot,
+  cloneWhiteboardStroke,
   createEmptyWhiteboardSnapshot,
+  WHITEBOARD_BACKGROUND_COLOR,
   WHITEBOARD_CANVAS_HEIGHT,
   WHITEBOARD_CANVAS_WIDTH,
   WHITEBOARD_COLOR_OPTIONS,
+  type WhiteboardColor,
+  type WhiteboardIncrementalEventPayload,
   type WhiteboardPoint,
   type WhiteboardSnapshot,
   type WhiteboardStroke,
   type WhiteboardTool,
-  type WhiteboardColor,
 } from "../types/whiteboard";
 
 const props = withDefaults(
@@ -17,14 +21,17 @@ const props = withDefaults(
     title?: string;
     snapshot?: WhiteboardSnapshot | null;
     backgroundImage?: string | null;
+    showToolbar?: boolean;
   }>(),
   {
     title: "",
+    showToolbar: true,
   },
 );
 
 const emit = defineEmits<{
   (event: "update:snapshot", snapshot: WhiteboardSnapshot): void;
+  (event: "sync-event", payload: WhiteboardIncrementalEventPayload): void;
 }>();
 
 const drawingCanvasRef = ref<HTMLCanvasElement | null>(null);
@@ -53,6 +60,7 @@ const stageStyle = computed(() => ({
   width: `${stageWidth.value}px`,
   height: `${stageHeight.value}px`,
 }));
+const isReadOnlyMode = computed(() => !props.showToolbar);
 
 function calculateStageSize() {
   const wrapper = canvasWrapperRef.value;
@@ -99,20 +107,14 @@ function calculateStageSize() {
 }
 
 function cloneSnapshot(snapshot: WhiteboardSnapshot): WhiteboardSnapshot {
-  return {
-    version: snapshot.version,
-    canvasWidth: snapshot.canvasWidth,
-    canvasHeight: snapshot.canvasHeight,
-    backgroundImage: snapshot.backgroundImage ?? null,
-    backgroundColor: snapshot.backgroundColor,
-    strokes: snapshot.strokes.map((stroke) => ({
-      id: stroke.id,
-      tool: stroke.tool,
-      color: stroke.color,
-      size: stroke.size,
-      points: stroke.points.map((point) => ({ x: point.x, y: point.y })),
-    })),
-  };
+  return cloneWhiteboardSnapshot(snapshot);
+}
+
+function emitSyncEvent(payload: WhiteboardIncrementalEventPayload) {
+  if (isReadOnlyMode.value) {
+    return;
+  }
+  emit("sync-event", payload);
 }
 
 function createStroke(tool: WhiteboardTool): WhiteboardStroke {
@@ -144,7 +146,7 @@ function getCanvasContext(canvasElement: HTMLCanvasElement | null) {
   return context;
 }
 
-function resolveBackgroundImageSource(imagePath: string | null | undefined) {
+function normalizeBackgroundInstruction(imagePath: string | null | undefined) {
   if (!imagePath) {
     return null;
   }
@@ -155,6 +157,26 @@ function resolveBackgroundImageSource(imagePath: string | null | undefined) {
   }
 
   return trimmed;
+}
+
+function resolveBackgroundImageSource(imagePath: string | null | undefined) {
+  const normalized = normalizeBackgroundInstruction(imagePath);
+  if (!normalized) {
+    return null;
+  }
+
+  const isAbsoluteSource =
+    normalized.startsWith("http://") ||
+    normalized.startsWith("https://") ||
+    normalized.startsWith("data:") ||
+    normalized.startsWith("blob:") ||
+    normalized.startsWith("/");
+
+  if (isAbsoluteSource) {
+    return normalized;
+  }
+
+  return new URL(`../assets/bg/${normalized}`, import.meta.url).href;
 }
 
 function loadImage(src: string) {
@@ -295,8 +317,14 @@ function updateBackgroundImage(
   shouldEmit: boolean,
 ) {
   currentSnapshot.value.backgroundImage =
-    resolveBackgroundImageSource(imagePath);
+    normalizeBackgroundInstruction(imagePath);
   void redrawBackgroundCanvas();
+  emitSyncEvent({
+    type: "background-change",
+    backgroundImage: currentSnapshot.value.backgroundImage,
+    backgroundColor:
+      currentSnapshot.value.backgroundColor || WHITEBOARD_BACKGROUND_COLOR,
+  });
   if (shouldEmit) {
     emitSnapshot();
   }
@@ -331,10 +359,19 @@ function appendPoint(point: WhiteboardPoint) {
   }
 
   stroke.points.push(point);
+  emitSyncEvent({
+    type: "stroke-point",
+    strokeId: stroke.id,
+    point: { x: point.x, y: point.y },
+  });
   redrawDrawingCanvas();
 }
 
 function beginDrawing(event: PointerEvent) {
+  if (isReadOnlyMode.value) {
+    return;
+  }
+
   const point = toCanvasPoint(event);
   if (!point) {
     return;
@@ -356,10 +393,18 @@ function beginDrawing(event: PointerEvent) {
   activeStroke.value = createStroke(currentTool.value);
   activeStroke.value.points.push(point);
   currentSnapshot.value.strokes.push(activeStroke.value);
+  emitSyncEvent({
+    type: "stroke-begin",
+    stroke: cloneWhiteboardStroke(activeStroke.value),
+  });
   redrawDrawingCanvas();
 }
 
 function continueDrawing(event: PointerEvent) {
+  if (isReadOnlyMode.value) {
+    return;
+  }
+
   if (!isDrawing.value) {
     return;
   }
@@ -373,6 +418,10 @@ function continueDrawing(event: PointerEvent) {
 }
 
 function endDrawing(event: PointerEvent) {
+  if (isReadOnlyMode.value) {
+    return;
+  }
+
   const canvasElement = drawingCanvasRef.value;
   if (canvasElement && event.isPrimary) {
     try {
@@ -389,6 +438,12 @@ function endDrawing(event: PointerEvent) {
   }
 
   isDrawing.value = false;
+  if (activeStroke.value) {
+    emitSyncEvent({
+      type: "stroke-end",
+      strokeId: activeStroke.value.id,
+    });
+  }
   activeStroke.value = null;
   emitSnapshot();
 }
@@ -396,6 +451,12 @@ function endDrawing(event: PointerEvent) {
 function selectPenColor(color: WhiteboardColor) {
   currentTool.value = "pen";
   currentColor.value = color;
+  emitSyncEvent({
+    type: "tool-change",
+    tool: "pen",
+    color: currentColor.value,
+    size: currentSize.value,
+  });
   emitSnapshot();
 }
 
@@ -403,6 +464,12 @@ function selectBrushSize(size: number) {
   currentTool.value = "pen";
   currentSize.value = size;
   brushSizeValue.value = size;
+  emitSyncEvent({
+    type: "tool-change",
+    tool: "pen",
+    color: currentColor.value,
+    size: currentSize.value,
+  });
   emitSnapshot();
 }
 
@@ -413,6 +480,12 @@ function updateBrushSize(value: number) {
 
 function activateEraser() {
   currentTool.value = "eraser";
+  emitSyncEvent({
+    type: "tool-change",
+    tool: "eraser",
+    color: currentColor.value,
+    size: currentSize.value + 10,
+  });
   emitSnapshot();
 }
 
@@ -424,6 +497,7 @@ function clearCanvas() {
   activeStroke.value = null;
   isDrawing.value = false;
   redrawDrawingCanvas();
+  emitSyncEvent({ type: "clear" });
   emitSnapshot();
 }
 
@@ -433,7 +507,7 @@ watch(
     if (!snapshot) {
       currentSnapshot.value = {
         ...createEmptyWhiteboardSnapshot(),
-        backgroundImage: resolveBackgroundImageSource(props.backgroundImage),
+        backgroundImage: normalizeBackgroundInstruction(props.backgroundImage),
       };
       redrawAll();
       return;
@@ -479,7 +553,11 @@ onBeforeUnmount(() => {
 
 <template>
   <v-card rounded="xl" elevation="8" class="whiteboard-shell h-100">
-    <v-card-title class="d-flex justify-center">
+    <v-card-title
+      v-if="props.showToolbar || props.title"
+      class="d-flex justify-center"
+      :class="{ 'py-2': !props.showToolbar }"
+    >
       <div
         class="toolbar-wrap d-flex flex-wrap ga-3 align-center justify-center"
       >
@@ -493,7 +571,7 @@ onBeforeUnmount(() => {
           {{ props.title }}
         </v-chip>
 
-        <div class="d-flex flex-wrap ga-2">
+        <div v-if="props.showToolbar" class="d-flex flex-wrap ga-2">
           <v-btn
             v-for="color in WHITEBOARD_COLOR_OPTIONS"
             :key="color"
@@ -511,9 +589,13 @@ onBeforeUnmount(() => {
           />
         </div>
 
-        <v-divider vertical class="mx-2 d-none d-md-flex" />
+        <v-divider
+          v-if="props.showToolbar"
+          vertical
+          class="mx-2 d-none d-md-flex"
+        />
 
-        <div class="brush-slider">
+        <div v-if="props.showToolbar" class="brush-slider">
           <v-slider
             :model-value="brushSizeValue"
             :min="4"
@@ -528,6 +610,7 @@ onBeforeUnmount(() => {
         </div>
 
         <v-btn
+          v-if="props.showToolbar"
           color="amber-darken-2"
           :variant="currentTool === 'eraser' ? 'flat' : 'tonal'"
           @click="activateEraser"
@@ -536,7 +619,11 @@ onBeforeUnmount(() => {
           橡皮擦
         </v-btn>
 
-        <v-btn color="error" variant="tonal" @click="clearCanvas"
+        <v-btn
+          v-if="props.showToolbar"
+          color="error"
+          variant="tonal"
+          @click="clearCanvas"
           >清除畫布</v-btn
         >
       </div>
@@ -555,6 +642,9 @@ onBeforeUnmount(() => {
           <canvas
             ref="drawingCanvasRef"
             class="whiteboard-canvas whiteboard-canvas--drawing"
+            :class="{
+              'whiteboard-canvas--readonly': isReadOnlyMode,
+            }"
             width="1280"
             height="720"
             @pointerdown.prevent="beginDrawing"
@@ -617,6 +707,11 @@ onBeforeUnmount(() => {
 .whiteboard-canvas--drawing {
   touch-action: none;
   cursor: crosshair;
+}
+
+.whiteboard-canvas--readonly {
+  pointer-events: none;
+  cursor: default;
 }
 
 .toolbar-wrap {

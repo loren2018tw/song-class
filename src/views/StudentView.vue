@@ -1,19 +1,55 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, ref } from "vue";
 import NicknameJoinCard from "../components/NicknameJoinCard.vue";
+import WhiteboardCanvas from "../components/WhiteboardCanvas.vue";
 import { createPeerConnection } from "../composables/usePeerConnection";
 import type { SignalEnvelope } from "../types/session";
+import {
+  cloneWhiteboardSnapshot,
+  cloneWhiteboardStroke,
+  createEmptyWhiteboardSnapshot,
+  isWhiteboardSyncMessage,
+  type WhiteboardBoardTab,
+  type WhiteboardEventBatchMessage,
+  type WhiteboardIncrementalEvent,
+  type WhiteboardIncrementalEventPayload,
+  type WhiteboardMode,
+  type WhiteboardSnapshot,
+  type WhiteboardSnapshotRequestMessage,
+  type WhiteboardStudentEventBatchMessage,
+  type WhiteboardSyncMessage,
+} from "../types/whiteboard";
 
 const props = defineProps<{
   baseUrl: string;
 }>();
 
+const STUDENT_BATCH_INTERVAL_MS = 33;
+const STUDENT_BATCH_MAX_EVENTS = 24;
+
 const statusText = ref("尚未連線");
 const isConnected = ref(false);
 const signalError = ref("");
+const activeMode = ref<WhiteboardMode>("home");
+const activeTab = ref<WhiteboardBoardTab>("teacher-board");
+const modeVersion = ref(0);
+const tabVersion = ref(0);
+
+const teacherSnapshot = ref<WhiteboardSnapshot>(
+  createEmptyWhiteboardSnapshot(),
+);
+const teacherLastAppliedSequence = ref(0);
+
+const studentSnapshot = ref<WhiteboardSnapshot>(
+  createEmptyWhiteboardSnapshot(),
+);
+let studentNextSequence = 1;
+const queuedStudentEvents: WhiteboardIncrementalEvent[] = [];
+let studentBatchFlushTimer: number | null = null;
 
 let ws: WebSocket | null = null;
 let peer: RTCPeerConnection | null = null;
+let lessonChannel: RTCDataChannel | null = null;
 let selfId: string | undefined;
 let teacherId: string | undefined;
 let pendingJoinNickname: string | null = null;
@@ -33,11 +69,115 @@ function sendSignal(payload: SignalEnvelope) {
   }
 }
 
+function sendLessonMessage(message: WhiteboardSyncMessage) {
+  if (!lessonChannel || lessonChannel.readyState !== "open") {
+    return;
+  }
+  lessonChannel.send(JSON.stringify(message));
+}
+
+function requestTeacherSnapshot(
+  reason: WhiteboardSnapshotRequestMessage["reason"],
+) {
+  sendLessonMessage({
+    kind: "snapshot-request",
+    boardTab: "teacher-board",
+    reason,
+    sinceSeq: teacherLastAppliedSequence.value,
+  });
+}
+
+function stopStudentBatchTimer() {
+  if (studentBatchFlushTimer !== null) {
+    window.clearTimeout(studentBatchFlushTimer);
+    studentBatchFlushTimer = null;
+  }
+}
+
+function flushStudentEvents() {
+  if (queuedStudentEvents.length === 0) {
+    return;
+  }
+
+  stopStudentBatchTimer();
+
+  const events = queuedStudentEvents.splice(0, queuedStudentEvents.length);
+  const message: WhiteboardStudentEventBatchMessage = {
+    kind: "student-events-batch",
+    senderId: selfId,
+    tabVersion: tabVersion.value,
+    boardTab: "student-board",
+    startSeq: events[0].seq,
+    endSeq: events[events.length - 1].seq,
+    events,
+  };
+
+  sendLessonMessage(message);
+}
+
+function scheduleStudentBatchFlush() {
+  if (studentBatchFlushTimer !== null) {
+    return;
+  }
+
+  studentBatchFlushTimer = window.setTimeout(() => {
+    studentBatchFlushTimer = null;
+    flushStudentEvents();
+  }, STUDENT_BATCH_INTERVAL_MS);
+}
+
+function enqueueStudentEvent(payload: WhiteboardIncrementalEventPayload) {
+  if (
+    activeMode.value !== "whiteboard" ||
+    activeTab.value !== "student-board"
+  ) {
+    return;
+  }
+
+  queuedStudentEvents.push({
+    ...payload,
+    seq: studentNextSequence,
+    timestamp: Date.now(),
+  });
+
+  studentNextSequence += 1;
+
+  if (queuedStudentEvents.length >= STUDENT_BATCH_MAX_EVENTS) {
+    flushStudentEvents();
+    return;
+  }
+
+  scheduleStudentBatchFlush();
+}
+
+function onStudentTabChanged(tab: unknown) {
+  if (tab !== "teacher-board" && tab !== "student-board") {
+    return;
+  }
+
+  activeTab.value = tab;
+}
+
 function resetToJoinState(message = "連線已中斷，請重新加入") {
   isConnected.value = false;
   teacherId = undefined;
   selfId = undefined;
+  activeMode.value = "home";
+  activeTab.value = "teacher-board";
+  modeVersion.value = 0;
+  tabVersion.value = 0;
+  teacherLastAppliedSequence.value = 0;
+  teacherSnapshot.value = createEmptyWhiteboardSnapshot();
+  studentSnapshot.value = createEmptyWhiteboardSnapshot();
+  studentNextSequence = 1;
+  queuedStudentEvents.length = 0;
+  stopStudentBatchTimer();
   queuedIceCandidates.length = 0;
+
+  if (lessonChannel) {
+    lessonChannel.close();
+    lessonChannel = null;
+  }
 
   if (peer) {
     peer.close();
@@ -135,6 +275,218 @@ function ensureSocket() {
   };
 }
 
+function ensureStroke(
+  snapshot: WhiteboardSnapshot,
+  event: WhiteboardIncrementalEvent,
+) {
+  if (event.type !== "stroke-point") {
+    return null;
+  }
+
+  return (
+    snapshot.strokes.find((stroke) => stroke.id === event.strokeId) ?? null
+  );
+}
+
+function applyIncrementalEvent(
+  snapshot: WhiteboardSnapshot,
+  event: WhiteboardIncrementalEvent,
+) {
+  switch (event.type) {
+    case "stroke-begin": {
+      const exists = snapshot.strokes.some(
+        (stroke) => stroke.id === event.stroke.id,
+      );
+      if (!exists) {
+        snapshot.strokes.push(cloneWhiteboardStroke(event.stroke));
+      }
+      break;
+    }
+    case "stroke-point": {
+      const stroke = ensureStroke(snapshot, event);
+      if (!stroke) {
+        throw new Error("missing-stroke");
+      }
+      stroke.points.push({ x: event.point.x, y: event.point.y });
+      break;
+    }
+    case "stroke-end": {
+      break;
+    }
+    case "clear": {
+      snapshot.strokes = [];
+      break;
+    }
+    case "background-change": {
+      snapshot.backgroundImage = event.backgroundImage ?? null;
+      snapshot.backgroundColor = event.backgroundColor;
+      break;
+    }
+    case "tool-change": {
+      break;
+    }
+  }
+}
+
+function applyTeacherBatch(message: WhiteboardEventBatchMessage) {
+  const expectedStart = teacherLastAppliedSequence.value + 1;
+  if (message.startSeq !== expectedStart) {
+    requestTeacherSnapshot("seq-gap");
+    return;
+  }
+
+  const nextSnapshot = cloneWhiteboardSnapshot(teacherSnapshot.value);
+
+  try {
+    let expectedSeq = expectedStart;
+    for (const event of message.events) {
+      if (event.seq !== expectedSeq) {
+        requestTeacherSnapshot("seq-gap");
+        return;
+      }
+      applyIncrementalEvent(nextSnapshot, event);
+      expectedSeq += 1;
+    }
+  } catch {
+    requestTeacherSnapshot("seq-gap");
+    return;
+  }
+
+  teacherSnapshot.value = nextSnapshot;
+  teacherLastAppliedSequence.value = message.endSeq;
+}
+
+function handleLessonMessage(raw: string) {
+  const parsed = JSON.parse(raw) as unknown;
+  if (!isWhiteboardSyncMessage(parsed)) {
+    return;
+  }
+
+  if (parsed.kind === "mode-sync") {
+    if (parsed.modeVersion < modeVersion.value) {
+      return;
+    }
+
+    if (parsed.tabVersion < tabVersion.value) {
+      return;
+    }
+
+    modeVersion.value = parsed.modeVersion;
+    tabVersion.value = parsed.tabVersion;
+    activeMode.value = parsed.mode;
+    return;
+  }
+
+  if (parsed.kind === "whiteboard-snapshot") {
+    if (
+      parsed.modeVersion < modeVersion.value ||
+      parsed.tabVersion < tabVersion.value
+    ) {
+      return;
+    }
+
+    modeVersion.value = parsed.modeVersion;
+    tabVersion.value = parsed.tabVersion;
+
+    if (parsed.boardTab === "teacher-board") {
+      teacherSnapshot.value = cloneWhiteboardSnapshot(parsed.snapshot);
+      teacherLastAppliedSequence.value = parsed.seq;
+      return;
+    }
+
+    if (parsed.boardTab === "student-board") {
+      studentSnapshot.value = cloneWhiteboardSnapshot(parsed.snapshot);
+      queuedStudentEvents.length = 0;
+      studentNextSequence = parsed.seq + 1;
+      return;
+    }
+  }
+
+  if (parsed.kind === "whiteboard-events-batch") {
+    if (
+      parsed.modeVersion < modeVersion.value ||
+      parsed.tabVersion < tabVersion.value
+    ) {
+      return;
+    }
+
+    if (parsed.boardTab !== "teacher-board") {
+      return;
+    }
+
+    modeVersion.value = parsed.modeVersion;
+    tabVersion.value = parsed.tabVersion;
+    applyTeacherBatch(parsed);
+    return;
+  }
+
+  if (parsed.kind === "student-board-control") {
+    if (parsed.action === "clear-all") {
+      stopStudentBatchTimer();
+      queuedStudentEvents.length = 0;
+      studentNextSequence = 1;
+      studentSnapshot.value = {
+        ...createEmptyWhiteboardSnapshot(),
+        backgroundImage: studentSnapshot.value.backgroundImage ?? null,
+      };
+      return;
+    }
+
+    if (parsed.action === "set-background") {
+      studentSnapshot.value = {
+        ...cloneWhiteboardSnapshot(studentSnapshot.value),
+        backgroundImage: parsed.backgroundImage ?? null,
+      };
+      return;
+    }
+
+    if (parsed.action === "replace-strokes") {
+      const nextStrokes = (parsed.strokes ?? []).map((stroke) =>
+        cloneWhiteboardStroke(stroke),
+      );
+      studentSnapshot.value = {
+        ...cloneWhiteboardSnapshot(studentSnapshot.value),
+        strokes: nextStrokes,
+      };
+    }
+  }
+}
+
+function bindLessonChannel(channel: RTCDataChannel) {
+  lessonChannel = channel;
+
+  lessonChannel.onopen = () => {
+    isConnected.value = true;
+    statusText.value = "已連線，請專心學習";
+    signalError.value = "";
+    requestTeacherSnapshot("join-init");
+  };
+
+  lessonChannel.onmessage = (event) => {
+    try {
+      handleLessonMessage(String(event.data));
+    } catch (error) {
+      signalError.value = `資料通道處理失敗: ${String(error)}`;
+    }
+  };
+
+  lessonChannel.onclose = () => {
+    resetToJoinState("資料通道已關閉，請重新加入");
+  };
+
+  lessonChannel.onerror = () => {
+    signalError.value = "資料通道發生錯誤";
+  };
+}
+
+function handleStudentSnapshot(snapshot: WhiteboardSnapshot) {
+  studentSnapshot.value = cloneWhiteboardSnapshot(snapshot);
+}
+
+function handleStudentSyncEvent(payload: WhiteboardIncrementalEventPayload) {
+  enqueueStudentEvent(payload);
+}
+
 async function startOffer() {
   if (!teacherId) {
     statusText.value = "等待教師端就緒";
@@ -150,14 +502,10 @@ async function startOffer() {
         payload: candidate,
       });
     },
+    onDataChannel: (channel) => {
+      bindLessonChannel(channel);
+    },
     onConnectionStateChange: (state) => {
-      if (state === "connected") {
-        isConnected.value = true;
-        statusText.value = "已連線，請專心學習";
-        signalError.value = "";
-        return;
-      }
-
       if (["disconnected", "failed", "closed"].includes(state)) {
         resetToJoinState("連線已中斷，請重新加入");
       }
@@ -165,14 +513,7 @@ async function startOffer() {
   });
 
   const channel = peer.createDataChannel("lesson");
-  channel.onopen = () => {
-    isConnected.value = true;
-    statusText.value = "已連線，請專心學習";
-    signalError.value = "";
-  };
-  channel.onclose = () => {
-    resetToJoinState("資料通道已關閉，請重新加入");
-  };
+  bindLessonChannel(channel);
 
   const offer = await peer.createOffer();
   await peer.setLocalDescription(offer);
@@ -196,21 +537,39 @@ function handleJoin(nickname: string) {
 }
 
 onBeforeUnmount(() => {
+  stopStudentBatchTimer();
   if (ws) {
     ws.close();
+  }
+  if (lessonChannel) {
+    lessonChannel.close();
   }
   if (peer) {
     peer.close();
   }
+  lessonChannel = null;
   peer = null;
 });
 </script>
 
 <template>
-  <v-container class="py-8">
+  <v-container v-if="!isConnected || activeMode !== 'whiteboard'" class="py-8">
     <v-row justify="center">
-      <v-col cols="12" md="7" lg="5">
+      <v-col cols="12" md="8" lg="7">
         <NicknameJoinCard v-if="!isConnected" @submit="handleJoin" />
+
+        <v-card
+          v-else
+          rounded="xl"
+          elevation="8"
+          class="d-flex align-center justify-center py-16"
+        >
+          <v-card-text class="text-center">
+            <div class="text-h4 font-weight-black mb-2">請專心學習</div>
+            <div class="text-medium-emphasis">等待教師切換課堂功能</div>
+          </v-card-text>
+        </v-card>
+
         <v-alert class="mt-4" type="info" variant="tonal">{{
           statusText
         }}</v-alert>
@@ -220,4 +579,70 @@ onBeforeUnmount(() => {
       </v-col>
     </v-row>
   </v-container>
+
+  <div v-else class="student-whiteboard-screen">
+    <v-tabs
+      color="primary"
+      density="compact"
+      :model-value="activeTab"
+      @update:model-value="onStudentTabChanged"
+    >
+      <v-tab value="teacher-board">
+        <v-icon icon="mdi-account" start />
+        教師白板
+      </v-tab>
+      <v-tab value="student-board">
+        <v-icon icon="mdi-account-multiple" start />
+        學生白板
+      </v-tab>
+    </v-tabs>
+
+    <div
+      v-show="activeTab === 'teacher-board'"
+      class="student-whiteboard-canvas-wrap"
+    >
+      <WhiteboardCanvas
+        title="教師白板"
+        :snapshot="teacherSnapshot"
+        :show-toolbar="false"
+        class="student-whiteboard-canvas"
+      />
+    </div>
+
+    <div
+      v-show="activeTab === 'student-board'"
+      class="student-whiteboard-canvas-wrap"
+    >
+      <WhiteboardCanvas
+        title="學生白板"
+        :snapshot="studentSnapshot"
+        class="student-whiteboard-canvas"
+        @update:snapshot="handleStudentSnapshot"
+        @sync-event="handleStudentSyncEvent"
+      />
+    </div>
+  </div>
 </template>
+
+<style scoped>
+.student-whiteboard-screen {
+  height: 100dvh;
+  max-height: 100dvh;
+  padding: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  box-sizing: border-box;
+  overflow: hidden;
+}
+
+.student-whiteboard-canvas-wrap {
+  min-height: 0;
+  flex: 1;
+  height: 100%;
+}
+
+.student-whiteboard-canvas {
+  height: 100%;
+}
+</style>
