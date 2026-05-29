@@ -48,6 +48,7 @@ const currentSize = ref(8);
 const brushSizeValue = ref(currentSize.value);
 const isDrawing = ref(false);
 const activeStroke = ref<WhiteboardStroke | null>(null);
+const drawingPointerId = ref<number | null>(null);
 const drawingLayerDirty = ref(true);
 const cachedFlattenedDrawingLayer = ref<{
   imageDataUrl: string;
@@ -55,6 +56,7 @@ const cachedFlattenedDrawingLayer = ref<{
   height: number;
   updatedAt: number;
 } | null>(null);
+const activeTouchPointerIds = new Set<number>();
 let strokeSequence = 0;
 let resizeObserver: ResizeObserver | null = null;
 let backgroundRenderSequence = 0;
@@ -455,6 +457,30 @@ function toCanvasPoint(event: PointerEvent): WhiteboardPoint | null {
   };
 }
 
+function isTouchPointer(event: PointerEvent) {
+  return event.pointerType === "touch";
+}
+
+function finishActiveStroke(shouldEmitSnapshot: boolean) {
+  if (!isDrawing.value) {
+    return;
+  }
+
+  isDrawing.value = false;
+  if (activeStroke.value) {
+    emitSyncEvent({
+      type: "stroke-end",
+      strokeId: activeStroke.value.id,
+    });
+  }
+
+  activeStroke.value = null;
+  drawingPointerId.value = null;
+  if (shouldEmitSnapshot) {
+    emitSnapshot();
+  }
+}
+
 function appendPoint(point: WhiteboardPoint) {
   const stroke = activeStroke.value;
   if (!stroke) {
@@ -476,6 +502,14 @@ function beginDrawing(event: PointerEvent) {
     return;
   }
 
+  if (isTouchPointer(event)) {
+    activeTouchPointerIds.add(event.pointerId);
+    if (activeTouchPointerIds.size > 1) {
+      finishActiveStroke(true);
+      return;
+    }
+  }
+
   const point = toCanvasPoint(event);
   if (!point) {
     return;
@@ -493,7 +527,10 @@ function beginDrawing(event: PointerEvent) {
       // 某些非原生觸發的事件沒有可捕捉 pointer，忽略即可。
     }
   }
+
+  event.preventDefault();
   isDrawing.value = true;
+  drawingPointerId.value = event.pointerId;
   activeStroke.value = createStroke(currentTool.value);
   activeStroke.value.points.push(point);
   currentSnapshot.value.strokes.push(activeStroke.value);
@@ -510,6 +547,17 @@ function continueDrawing(event: PointerEvent) {
     return;
   }
 
+  if (
+    drawingPointerId.value !== null &&
+    event.pointerId !== drawingPointerId.value
+  ) {
+    return;
+  }
+
+  if (isTouchPointer(event) && activeTouchPointerIds.size > 1) {
+    return;
+  }
+
   if (!isDrawing.value) {
     return;
   }
@@ -519,11 +567,23 @@ function continueDrawing(event: PointerEvent) {
     return;
   }
 
+  event.preventDefault();
   appendPoint(point);
 }
 
 function endDrawing(event: PointerEvent) {
   if (isReadOnlyMode.value) {
+    return;
+  }
+
+  if (isTouchPointer(event)) {
+    activeTouchPointerIds.delete(event.pointerId);
+  }
+
+  if (
+    drawingPointerId.value !== null &&
+    event.pointerId !== drawingPointerId.value
+  ) {
     return;
   }
 
@@ -542,15 +602,8 @@ function endDrawing(event: PointerEvent) {
     return;
   }
 
-  isDrawing.value = false;
-  if (activeStroke.value) {
-    emitSyncEvent({
-      type: "stroke-end",
-      strokeId: activeStroke.value.id,
-    });
-  }
-  activeStroke.value = null;
-  emitSnapshot();
+  event.preventDefault();
+  finishActiveStroke(true);
 }
 
 function selectPenColor(color: WhiteboardColor) {
@@ -668,7 +721,9 @@ onBeforeUnmount(() => {
     resizeObserver = null;
   }
   window.removeEventListener("resize", calculateStageSize);
+  activeTouchPointerIds.clear();
   activeStroke.value = null;
+  drawingPointerId.value = null;
 });
 </script>
 
@@ -676,7 +731,7 @@ onBeforeUnmount(() => {
   <v-card rounded="xl" elevation="8" class="whiteboard-shell h-100">
     <v-card-title
       v-if="props.showToolbar || props.title"
-      class="d-flex justify-center"
+      class="whiteboard-toolbar-title d-flex justify-center"
       :class="{ 'py-2': !props.showToolbar }"
     >
       <div
@@ -716,7 +771,7 @@ onBeforeUnmount(() => {
           class="mx-2 d-none d-md-flex"
         />
 
-        <div v-if="props.showToolbar" class="brush-slider">
+        <div v-if="props.showToolbar" class="brush-slider brush-slider--bottom">
           <v-slider
             :model-value="brushSizeValue"
             :min="4"
@@ -768,11 +823,11 @@ onBeforeUnmount(() => {
             }"
             width="1280"
             height="720"
-            @pointerdown.prevent="beginDrawing"
-            @pointermove.prevent="continueDrawing"
-            @pointerup.prevent="endDrawing"
-            @pointercancel.prevent="endDrawing"
-            @pointerleave.prevent="endDrawing"
+            @pointerdown="beginDrawing"
+            @pointermove="continueDrawing"
+            @pointerup="endDrawing"
+            @pointercancel="endDrawing"
+            @pointerleave="endDrawing"
           />
         </div>
       </div>
@@ -781,6 +836,11 @@ onBeforeUnmount(() => {
 </template>
 
 <style scoped>
+.whiteboard-toolbar-title {
+  min-height: 72px;
+  overflow: visible;
+}
+
 .whiteboard-shell {
   height: 100%;
   display: flex;
@@ -826,7 +886,7 @@ onBeforeUnmount(() => {
 }
 
 .whiteboard-canvas--drawing {
-  touch-action: none;
+  touch-action: pinch-zoom;
   cursor:
     url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='18' height='18' viewBox='0 0 18 18'%3E%3Ccircle cx='9' cy='9' r='5' fill='none' stroke='%23000000' stroke-width='1.5'/%3E%3Ccircle cx='9' cy='9' r='1.2' fill='%23000000'/%3E%3C/svg%3E")
       9 9,
@@ -848,6 +908,10 @@ onBeforeUnmount(() => {
 
 .brush-slider {
   width: min(320px, 70vw);
+}
+
+.brush-slider--bottom {
+  align-self: flex-end;
 }
 
 .color-chip {

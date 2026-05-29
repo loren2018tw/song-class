@@ -8,6 +8,7 @@ import {
   ref,
   watch,
 } from "vue";
+import QrcodeVue from "qrcode.vue";
 import WhiteboardCanvas from "../components/WhiteboardCanvas.vue";
 import StudentListCard from "../components/StudentListCard.vue";
 import { useAppVersion } from "../composables/useAppVersion";
@@ -51,6 +52,7 @@ const students = ref<StudentSession[]>([]);
 const wsStatus = ref("尚未連線");
 const rtcError = ref("");
 const rtcErrorVisible = ref(false);
+const studentQrDialogVisible = ref(false);
 const openUrlDialogVisible = ref(false);
 const studentOpenUrlInput = ref("");
 const studentOpenUrlError = ref("");
@@ -136,6 +138,20 @@ const wsUrl = computed(() => {
   base.search = "?role=teacher";
   return base.toString();
 });
+const studentJoinUrl = computed(() => {
+  const studentUrl = new URL("/", props.baseUrl);
+  return studentUrl.toString();
+});
+
+async function openStudentQrDialogAndCopyUrl() {
+  studentQrDialogVisible.value = true;
+
+  try {
+    await navigator.clipboard.writeText(studentJoinUrl.value);
+  } catch {
+    showRtcError("無法複製學生端連結，請手動複製。");
+  }
+}
 
 const quickQaStats = computed(() =>
   createQuickQaOptionStats(quickQaQuestion.value),
@@ -147,6 +163,9 @@ const quickQaIsOpen = computed(() => quickQaQuestion.value?.status === "open");
 const quickQaCanClose = computed(
   () =>
     quickQaQuestion.value !== null && quickQaQuestion.value.status === "open",
+);
+const quickQaEditorLocked = computed(
+  () => quickQaQuestion.value?.status === "open",
 );
 const quickQaHasQuestion = computed(() => quickQaQuestion.value !== null);
 const quickQaDetailsByOption = computed(() =>
@@ -376,6 +395,10 @@ function getStudentDisplayName(studentId: string): string {
 }
 
 function publishQuickQaQuestion() {
+  if (quickQaEditorLocked.value) {
+    return;
+  }
+
   const now = Date.now();
   quickQaQuestion.value = {
     id: `qq-${now}`,
@@ -400,6 +423,10 @@ function publishQuickQaQuestion() {
 }
 
 function clearQuickQaDraft() {
+  if (quickQaEditorLocked.value) {
+    return;
+  }
+
   quickQaQuestionInput.value = "";
   for (const option of QUICK_QA_OPTIONS) {
     quickQaOptionInputs[option] = "";
@@ -1298,6 +1325,25 @@ onBeforeUnmount(() => {
   <v-app>
     <v-app-bar title="song-class(教師端)">
       <template #append>
+        <div class="student-join-qr-wrap">
+          <span class="student-join-qr-text">學生端連結</span>
+          <v-btn
+            icon
+            variant="text"
+            size="small"
+            class="student-join-qr-btn"
+            aria-label="顯示學生端連結 QR Code"
+            @click="openStudentQrDialogAndCopyUrl"
+          >
+            <QrcodeVue
+              :value="studentJoinUrl"
+              :size="34"
+              level="M"
+              render-as="svg"
+              class="student-join-qr-small"
+            />
+          </v-btn>
+        </div>
         <span class="app-version-text">{{ appVersionLabel }}</span>
       </template>
     </v-app-bar>
@@ -1498,6 +1544,7 @@ onBeforeUnmount(() => {
                 <v-btn
                   color="primary"
                   size="large"
+                  :disabled="quickQaEditorLocked"
                   prepend-icon="mdi-send"
                   @click="publishQuickQaQuestion"
                 >
@@ -1508,6 +1555,7 @@ onBeforeUnmount(() => {
                   color="secondary"
                   size="large"
                   variant="outlined"
+                  :disabled="quickQaEditorLocked"
                   prepend-icon="mdi-eraser"
                   @click="clearQuickQaDraft"
                 >
@@ -1760,6 +1808,32 @@ onBeforeUnmount(() => {
       </v-card>
     </v-dialog>
 
+    <v-dialog v-model="studentQrDialogVisible" max-width="92vw" width="92vw">
+      <v-card rounded="lg" class="student-join-qr-dialog-card">
+        <v-card-title class="d-flex align-center justify-space-between">
+          <span class="text-h6">學生端連結 QR Code</span>
+          <v-btn
+            icon="mdi-close"
+            variant="text"
+            aria-label="關閉學生端連結 QR Code 對話框"
+            @click="studentQrDialogVisible = false"
+          />
+        </v-card-title>
+        <v-card-text class="student-join-qr-dialog-content">
+          <QrcodeVue
+            :value="studentJoinUrl"
+            :size="560"
+            level="H"
+            render-as="svg"
+            class="student-join-qr-large"
+          />
+          <div class="student-join-qr-url text-medium-emphasis">
+            {{ studentJoinUrl }}
+          </div>
+        </v-card-text>
+      </v-card>
+    </v-dialog>
+
     <v-dialog
       v-model="coeditDialogVisible"
       max-width="96vw"
@@ -1794,6 +1868,61 @@ onBeforeUnmount(() => {
 </template>
 
 <style scoped>
+.student-join-qr-wrap {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  margin-right: 12px;
+}
+
+.student-join-qr-text {
+  font-size: 0.8rem;
+  color: rgba(var(--v-theme-on-surface), 0.8);
+  white-space: nowrap;
+}
+
+.student-join-qr-btn {
+  min-width: 38px;
+  width: 38px;
+  height: 38px;
+  padding: 0;
+}
+
+.student-join-qr-small {
+  border-radius: 4px;
+  background: #fff;
+}
+
+.student-join-qr-dialog-card {
+  width: 100%;
+  min-height: min(90vh, 820px);
+}
+
+.student-join-qr-dialog-content {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  min-height: min(84vh, 760px);
+}
+
+.student-join-qr-large {
+  width: min(78vw, 78vh);
+  max-width: 100%;
+  height: auto;
+  background: #fff;
+  padding: 10px;
+  border-radius: 10px;
+}
+
+.student-join-qr-url {
+  max-width: 100%;
+  text-align: center;
+  font-size: 0.8rem;
+  word-break: break-all;
+}
+
 .app-version-text {
   font-size: 0.75rem;
   color: rgba(var(--v-theme-on-surface), 0.72);

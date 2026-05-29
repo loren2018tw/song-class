@@ -12,6 +12,8 @@ use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+use tauri::menu::{Menu, MenuItem};
+use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::Manager;
 use tokio::net::TcpListener;
 use tokio::sync::{mpsc, oneshot, Mutex};
@@ -178,11 +180,33 @@ async fn app_version() -> impl IntoResponse {
 }
 
 async fn student_page() -> impl IntoResponse {
-    Redirect::temporary("/app/?mode=student")
+    Redirect::temporary("/app?mode=student")
 }
 
 async fn teacher_page() -> impl IntoResponse {
-    Redirect::temporary("/app/?mode=teacher")
+    Redirect::temporary("/app?mode=teacher")
+}
+
+fn resolve_vite_host_from_header(host_header: &str) -> String {
+    let trimmed = host_header.trim();
+    if trimmed.is_empty() {
+        return "127.0.0.1".to_string();
+    }
+
+    if trimmed.starts_with('[') {
+        if let Some(end_index) = trimmed.find(']') {
+            return trimmed[..=end_index].to_string();
+        }
+        return trimmed.to_string();
+    }
+
+    if let Some((host, _port)) = trimmed.rsplit_once(':') {
+        if !host.contains(':') && !host.is_empty() {
+            return host.to_string();
+        }
+    }
+
+    trimmed.to_string()
 }
 
 async fn app_page(
@@ -195,8 +219,9 @@ async fn app_page(
         .and_then(|value| value.to_str().ok())
         .filter(|value| !value.is_empty())
         .unwrap_or("127.0.0.1:17860");
+    let vite_host = resolve_vite_host_from_header(host);
 
-    let target = format!("http://127.0.0.1:1420/?mode={mode}&base=http://{host}");
+    let target = format!("http://{vite_host}:1420/?mode={mode}&base=http://{host}");
     Redirect::temporary(&target)
 }
 
@@ -545,7 +570,6 @@ async fn start_server_impl(runtime: Arc<Mutex<BackendRuntime>>) -> Result<Server
     };
 
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
-    let frontend_index_exists = frontend_assets_root.join("index.html").is_file();
     let root_assets = ServeDir::new(frontend_assets_root.join("assets"));
     let mut router = Router::new()
         .route("/", get(student_page))
@@ -554,19 +578,21 @@ async fn start_server_impl(runtime: Arc<Mutex<BackendRuntime>>) -> Result<Server
         .route("/api/app/version", get(app_version))
         .route("/health", get(health))
         .route_service(
-            "/vite.svg",
-            ServeFile::new(frontend_assets_root.join("vite.svg")),
+            "/song-class.png",
+            ServeFile::new(frontend_assets_root.join("song-class.png")),
         )
         .route("/ws", get(ws_handler))
         .nest_service("/assets", root_assets)
         .with_state(HttpState { hub });
 
-    if frontend_index_exists {
+    if cfg!(debug_assertions) {
+        router = router
+            .route("/app", get(app_page))
+            .route("/app/", get(app_page));
+    } else {
         let app_assets = ServeDir::new(frontend_assets_root.clone())
             .not_found_service(ServeFile::new(frontend_assets_root.join("index.html")));
         router = router.nest_service("/app", app_assets);
-    } else {
-        router = router.route("/app", get(app_page));
     }
 
     let join_handle = tauri::async_runtime::spawn(async move {
@@ -715,11 +741,61 @@ fn resolve_frontend_assets_root(candidates: &[PathBuf]) -> PathBuf {
     PathBuf::from("../dist")
 }
 
+fn restore_main_window(app: &tauri::AppHandle) {
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.show();
+        let _ = window.unminimize();
+        let _ = window.set_focus();
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .setup(|app| {
+            let show_item =
+                MenuItem::with_id(app, "show-main-window", "顯示主視窗", true, None::<&str>)?;
+            let exit_item = MenuItem::with_id(app, "exit", "結束程式", true, None::<&str>)?;
+            let tray_menu = Menu::with_items(app, &[&show_item, &exit_item])?;
+
+            let mut tray_builder = TrayIconBuilder::with_id("main-tray")
+                .menu(&tray_menu)
+                .show_menu_on_left_click(true)
+                .on_menu_event(|app, event| match event.id().as_ref() {
+                    "show-main-window" => restore_main_window(app),
+                    "exit" => app.exit(0),
+                    _ => {}
+                })
+                .on_tray_icon_event(|tray, event| {
+                    let app = tray.app_handle();
+                    match event {
+                        TrayIconEvent::Click {
+                            button: MouseButton::Left,
+                            button_state: MouseButtonState::Down,
+                            ..
+                        }
+                        | TrayIconEvent::Click {
+                            button: MouseButton::Left,
+                            button_state: MouseButtonState::Up,
+                            ..
+                        }
+                        | TrayIconEvent::DoubleClick {
+                            button: MouseButton::Left,
+                            ..
+                        } => {
+                            restore_main_window(&app);
+                        }
+                        _ => {}
+                    }
+                });
+
+            if let Some(tray_icon) = app.default_window_icon().cloned() {
+                tray_builder = tray_builder.icon(tray_icon);
+            }
+
+            tray_builder.build(app)?;
+
             let tauri_resource_dir = app
                 .path()
                 .resource_dir()
@@ -745,6 +821,16 @@ pub fn run() {
             get_server_debug_info,
             get_app_version
         ])
+        .on_window_event(|window, event| {
+            if window.label() != "main" {
+                return;
+            }
+
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                api.prevent_close();
+                let _ = window.hide();
+            }
+        })
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

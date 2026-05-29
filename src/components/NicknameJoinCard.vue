@@ -1,11 +1,20 @@
 <script setup lang="ts">
-import { computed, ref } from "vue";
+import { computed, ref, watch } from "vue";
+
+const props = withDefaults(
+  defineProps<{
+    initialNickname?: string;
+  }>(),
+  {
+    initialNickname: "",
+  },
+);
 
 const emit = defineEmits<{
   submit: [nickname: string];
 }>();
 
-const nickname = ref("");
+const nickname = ref(props.initialNickname);
 const error = ref("");
 
 const hasError = computed(() => error.value.length > 0);
@@ -19,6 +28,13 @@ function onSubmit() {
   error.value = "";
   emit("submit", trimmed);
 }
+
+watch(
+  () => props.initialNickname,
+  (nextNickname) => {
+    nickname.value = nextNickname;
+  },
+);
 </script>
 
 <template>

@@ -2,7 +2,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { computed, onBeforeUnmount, onMounted, ref } from "vue";
-import ConnectionInfoCard from "../components/ConnectionInfoCard.vue";
 import StudentListCard from "../components/StudentListCard.vue";
 import { useAppVersion } from "../composables/useAppVersion";
 import type {
@@ -10,19 +9,6 @@ import type {
   SignalEnvelope,
   StudentSession,
 } from "../types/session";
-
-type ServerDebugInfo = {
-  frontend_assets_root: string;
-  frontend_index_exists: boolean;
-  frontend_assets_dir_exists: boolean;
-  checked_frontend_paths: string[];
-  executable_path?: string;
-  tauri_resource_dir?: string;
-  app_teacher_url: string;
-  app_student_url: string;
-  teacher_redirect_url: string;
-  student_redirect_url: string;
-};
 
 type DebugLogEntry = {
   time: string;
@@ -39,7 +25,6 @@ const serverInfo = ref<ServerInfo>({
 const students = ref<StudentSession[]>([]);
 const wsStatus = ref("尚未連線");
 const actionError = ref("");
-const debugInfo = ref<ServerDebugInfo | null>(null);
 const debugLogs = ref<DebugLogEntry[]>([]);
 
 let ws: WebSocket | null = null;
@@ -53,19 +38,6 @@ const wsUrl = computed(() => {
   base.pathname = "/ws";
   base.search = "?role=console";
   return base.toString();
-});
-
-const serviceLabel = computed(() => {
-  switch (serverInfo.value.status) {
-    case "running":
-      return "可連線";
-    case "starting":
-      return "啟動中";
-    case "error":
-      return "錯誤";
-    default:
-      return "未啟動";
-  }
 });
 
 const teacherBrowserUrl = computed(() => {
@@ -92,6 +64,10 @@ const importantRoutes = computed(() => {
   };
 });
 
+const infoLogs = computed(() =>
+  debugLogs.value.filter((entry) => entry.level === "info"),
+);
+
 function appendLog(message: string, level: DebugLogEntry["level"] = "info") {
   const next: DebugLogEntry = {
     time: new Date().toLocaleTimeString("zh-TW", { hour12: false }),
@@ -106,14 +82,6 @@ async function refreshServerInfo() {
   serverInfo.value = await invoke<ServerInfo>("get_server_info");
   appendLog(
     `server_info: status=${serverInfo.value.status}, url=${serverInfo.value.url}, ip=${serverInfo.value.ip}`,
-  );
-}
-
-async function refreshServerDebugInfo() {
-  debugInfo.value = await invoke<ServerDebugInfo>("get_server_debug_info");
-  appendLog(
-    `static_root=${debugInfo.value.frontend_assets_root}, index=${debugInfo.value.frontend_index_exists}, assets_dir=${debugInfo.value.frontend_assets_dir_exists}`,
-    debugInfo.value.frontend_index_exists ? "info" : "warn",
   );
 }
 
@@ -171,7 +139,6 @@ async function restartServer() {
   appendLog("restart_server");
   await invoke("start_server");
   await refreshServerInfo();
-  await refreshServerDebugInfo();
   connectConsoleSocket();
 }
 
@@ -192,11 +159,9 @@ function clearLogs() {
 onMounted(async () => {
   appendLog("console_bootstrap_start");
   await refreshServerInfo();
-  await refreshServerDebugInfo();
   if (serverInfo.value.status !== "running") {
     await invoke("start_server");
     await refreshServerInfo();
-    await refreshServerDebugInfo();
   }
   connectConsoleSocket();
   appendLog(`route_teacher=${importantRoutes.value.appTeacher}`);
@@ -242,13 +207,21 @@ onBeforeUnmount(() => {
 
     <v-row>
       <v-col cols="12" md="7">
-        <ConnectionInfoCard
-          title="連線入口資訊"
-          :status-label="serviceLabel"
-          :server-url="serverInfo.url"
-          :ip="serverInfo.ip"
-          :error-message="serverInfo.error"
-        />
+        <v-card rounded="xl" elevation="6" class="h-100">
+          <v-card-title>連線入口資訊</v-card-title>
+          <v-card-text>
+            <v-alert
+              v-if="serverInfo.error"
+              type="error"
+              variant="tonal"
+              class="mb-3"
+            >
+              {{ serverInfo.error }}
+            </v-alert>
+            <div>教師入口: {{ importantRoutes.appTeacher }}</div>
+            <div>學生入口: {{ importantRoutes.appStudent }}</div>
+          </v-card-text>
+        </v-card>
       </v-col>
       <v-col cols="12" md="5">
         <StudentListCard title="已連入學生" :students="students" />
@@ -258,53 +231,24 @@ onBeforeUnmount(() => {
     <v-row class="mt-1">
       <v-col cols="12">
         <v-card variant="outlined">
-          <v-card-title class="d-flex justify-space-between align-center">
-            <span>除錯 Log</span>
-            <v-btn size="small" variant="text" @click="clearLogs">清空</v-btn>
-          </v-card-title>
+          <v-card-title>除錯 Log</v-card-title>
           <v-card-text class="pt-0">
-            <div class="text-caption text-medium-emphasis mb-3">
-              <div>教師入口: {{ importantRoutes.appTeacher }}</div>
-              <div>學生入口: {{ importantRoutes.appStudent }}</div>
-              <div>Teacher Redirect: {{ importantRoutes.teacherRedirect }}</div>
-              <div>Health: {{ importantRoutes.health }}</div>
-              <div v-if="debugInfo">
-                靜態資源根目錄: {{ debugInfo.frontend_assets_root }}
-              </div>
-              <div v-if="debugInfo">
-                index.html:
-                {{ debugInfo.frontend_index_exists ? "存在" : "不存在" }} /
-                assets:
-                {{ debugInfo.frontend_assets_dir_exists ? "存在" : "不存在" }}
-              </div>
-              <div v-if="debugInfo">
-                掃描路徑:
-                {{
-                  Array.isArray(debugInfo.checked_frontend_paths) &&
-                  debugInfo.checked_frontend_paths.length > 0
-                    ? debugInfo.checked_frontend_paths.join(" | ")
-                    : "(後端未回傳掃描路徑，可能仍在執行舊版安裝檔)"
-                }}
-              </div>
-              <div v-if="debugInfo?.tauri_resource_dir">
-                Tauri resource_dir: {{ debugInfo.tauri_resource_dir }}
-              </div>
-              <div v-if="debugInfo?.executable_path">
-                執行檔路徑: {{ debugInfo.executable_path }}
-              </div>
-            </div>
             <div class="debug-log-box">
               <div
-                v-for="(entry, index) in debugLogs"
-                :key="`${entry.time}-${index}`"
+                v-for="(entry, index) in infoLogs"
+                :key="`${entry.time}-info-${index}`"
                 class="debug-log-line"
               >
                 <span class="debug-log-time">[{{ entry.time }}]</span>
-                <span :class="`debug-log-${entry.level}`">{{
-                  entry.level
-                }}</span>
+                <span class="debug-log-info">info</span>
                 <span>{{ entry.message }}</span>
               </div>
+              <div v-if="infoLogs.length === 0" class="debug-log-time">
+                目前沒有 info 訊息
+              </div>
+            </div>
+            <div class="mt-2 d-flex justify-end">
+              <v-btn size="small" variant="text" @click="clearLogs">清空</v-btn>
             </div>
           </v-card-text>
         </v-card>
@@ -338,16 +282,6 @@ onBeforeUnmount(() => {
 
 .debug-log-info {
   color: #166534;
-  min-width: 34px;
-}
-
-.debug-log-warn {
-  color: #a16207;
-  min-width: 34px;
-}
-
-.debug-log-error {
-  color: #b91c1c;
   min-width: 34px;
 }
 </style>

@@ -1,7 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { computed, onMounted, ref } from "vue";
 
-const VERSION_FOOTER = "Loren(loren@.gmail.com)";
+const VERSION_FOOTER = "by Loren Li(loren.tw@gmail.com)";
 
 type AppVersionResponse = {
   version: string;

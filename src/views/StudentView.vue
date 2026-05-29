@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, ref } from "vue";
+import { computed, onBeforeUnmount, onMounted, ref } from "vue";
 import NicknameJoinCard from "../components/NicknameJoinCard.vue";
 import WhiteboardCanvas from "../components/WhiteboardCanvas.vue";
 import { useAppVersion } from "../composables/useAppVersion";
@@ -34,6 +34,7 @@ const { appVersionLabel } = useAppVersion(props.baseUrl);
 
 const STUDENT_BATCH_INTERVAL_MS = 33;
 const STUDENT_BATCH_MAX_EVENTS = 24;
+const LAST_STUDENT_NICKNAME_STORAGE_KEY = "song-class:last-student-nickname";
 
 const statusText = ref("尚未連線");
 const isConnected = ref(false);
@@ -65,6 +66,8 @@ let selfId: string | undefined;
 let teacherId: string | undefined;
 let pendingJoinNickname: string | null = null;
 const queuedIceCandidates: RTCIceCandidateInit[] = [];
+const isJoinRequested = ref(false);
+const lastJoinedNickname = ref(readLastStudentNickname());
 
 const wsUrl = computed(() => {
   const base = new URL(props.baseUrl);
@@ -114,6 +117,50 @@ function optionBadgeColor(option: QuickQaOption): string {
     case "D":
       return "error";
   }
+}
+
+function readLastStudentNickname(): string {
+  try {
+    return localStorage.getItem(LAST_STUDENT_NICKNAME_STORAGE_KEY) ?? "";
+  } catch {
+    return "";
+  }
+}
+
+function saveLastStudentNickname(nickname: string) {
+  try {
+    localStorage.setItem(LAST_STUDENT_NICKNAME_STORAGE_KEY, nickname);
+  } catch {
+    // Ignore storage failures and continue with in-memory value.
+  }
+}
+
+function clearLastStudentNickname() {
+  try {
+    localStorage.removeItem(LAST_STUDENT_NICKNAME_STORAGE_KEY);
+  } catch {
+    // Ignore storage failures and continue with in-memory value.
+  }
+}
+
+function closeSignalSocket() {
+  if (!ws) {
+    return;
+  }
+
+  ws.onopen = null;
+  ws.onclose = null;
+  ws.onerror = null;
+  ws.onmessage = null;
+
+  if (
+    ws.readyState === WebSocket.OPEN ||
+    ws.readyState === WebSocket.CONNECTING
+  ) {
+    ws.close();
+  }
+
+  ws = null;
 }
 
 function sendSignal(payload: SignalEnvelope) {
@@ -226,6 +273,7 @@ function onStudentTabChanged(tab: unknown) {
 
 function resetToJoinState(message = "連線已中斷，請重新加入") {
   isConnected.value = false;
+  isJoinRequested.value = false;
   teacherId = undefined;
   selfId = undefined;
   activeMode.value = "home";
@@ -308,6 +356,7 @@ function ensureSocket() {
     signalError.value = "";
     if (pendingJoinNickname) {
       sendSignal({ event: "join", nickname: pendingJoinNickname });
+      isJoinRequested.value = true;
       pendingJoinNickname = null;
     }
   };
@@ -669,6 +718,7 @@ function bindLessonChannel(channel: RTCDataChannel) {
 
   lessonChannel.onopen = () => {
     isConnected.value = true;
+    isJoinRequested.value = false;
     statusText.value = "已連線，請專心學習";
     signalError.value = "";
     requestTeacherSnapshot("join-init");
@@ -693,6 +743,52 @@ function bindLessonChannel(channel: RTCDataChannel) {
 
 function handleStudentSyncEvent(payload: WhiteboardIncrementalEventPayload) {
   enqueueStudentEvent(payload);
+}
+
+function attemptResumeReconnect(reason: string) {
+  if (isConnected.value || isJoinRequested.value) {
+    return;
+  }
+
+  if (document.visibilityState === "hidden") {
+    return;
+  }
+
+  const nickname = lastJoinedNickname.value.trim();
+  if (!nickname) {
+    return;
+  }
+
+  statusText.value = `偵測到裝置恢復(${reason})，正在自動重連...`;
+  handleJoin(nickname);
+}
+
+function handleVisibilityChange() {
+  if (document.visibilityState === "visible") {
+    attemptResumeReconnect("回到前景");
+  }
+}
+
+function handlePageShow() {
+  attemptResumeReconnect("頁面恢復");
+}
+
+function handleWindowFocus() {
+  attemptResumeReconnect("取得焦點");
+}
+
+function handleNetworkOnline() {
+  attemptResumeReconnect("網路恢復");
+}
+
+function leaveClassroom() {
+  pendingJoinNickname = null;
+  isJoinRequested.value = false;
+  signalError.value = "";
+  lastJoinedNickname.value = "";
+  clearLastStudentNickname();
+  closeSignalSocket();
+  resetToJoinState("已離開教室");
 }
 
 async function startOffer() {
@@ -735,20 +831,53 @@ async function startOffer() {
 }
 
 function handleJoin(nickname: string) {
+  const trimmedNickname = nickname.trim();
+  if (!trimmedNickname) {
+    signalError.value = "請輸入有效暱稱";
+    return;
+  }
+
+  lastJoinedNickname.value = trimmedNickname;
+  saveLastStudentNickname(trimmedNickname);
+
   ensureSocket();
+
+  if (
+    isJoinRequested.value &&
+    pendingJoinNickname === trimmedNickname &&
+    ws &&
+    ws.readyState < WebSocket.CLOSED
+  ) {
+    return;
+  }
+
   if (ws && ws.readyState === WebSocket.OPEN) {
-    sendSignal({ event: "join", nickname });
+    sendSignal({ event: "join", nickname: trimmedNickname });
+    isJoinRequested.value = true;
   } else {
-    pendingJoinNickname = nickname;
+    pendingJoinNickname = trimmedNickname;
+    isJoinRequested.value = true;
     statusText.value = "連線建立中，準備送出加入請求...";
   }
 }
 
+onMounted(() => {
+  document.addEventListener("visibilitychange", handleVisibilityChange);
+  window.addEventListener("pageshow", handlePageShow);
+  window.addEventListener("focus", handleWindowFocus);
+  window.addEventListener("online", handleNetworkOnline);
+
+  attemptResumeReconnect("頁面載入");
+});
+
 onBeforeUnmount(() => {
+  document.removeEventListener("visibilitychange", handleVisibilityChange);
+  window.removeEventListener("pageshow", handlePageShow);
+  window.removeEventListener("focus", handleWindowFocus);
+  window.removeEventListener("online", handleNetworkOnline);
+
   stopStudentBatchTimer();
-  if (ws) {
-    ws.close();
-  }
+  closeSignalSocket();
   if (lessonChannel) {
     lessonChannel.close();
   }
@@ -764,6 +893,16 @@ onBeforeUnmount(() => {
   <v-app>
     <v-app-bar title="song-class(學生端)">
       <template #append>
+        <v-btn
+          v-if="isConnected"
+          class="mr-2"
+          color="error"
+          variant="outlined"
+          size="small"
+          @click="leaveClassroom"
+        >
+          離開教室
+        </v-btn>
         <span class="app-version-text">{{ appVersionLabel }}</span>
       </template>
     </v-app-bar>
@@ -772,7 +911,11 @@ onBeforeUnmount(() => {
       <v-container v-if="!isConnected || activeMode === 'home'" class="py-8">
         <v-row justify="center">
           <v-col cols="12" md="8" lg="7">
-            <NicknameJoinCard v-if="!isConnected" @submit="handleJoin" />
+            <NicknameJoinCard
+              v-if="!isConnected"
+              :initial-nickname="lastJoinedNickname"
+              @submit="handleJoin"
+            />
 
             <v-card
               v-else
