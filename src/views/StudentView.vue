@@ -6,10 +6,13 @@ import { useAppVersion } from "../composables/useAppVersion";
 import { createPeerConnection } from "../composables/usePeerConnection";
 import type { SignalEnvelope } from "../types/session";
 import {
+  QUICK_QA_OPTIONS,
   cloneWhiteboardSnapshot,
   cloneWhiteboardStroke,
   createEmptyWhiteboardSnapshot,
   isWhiteboardSyncMessage,
+  type QuickQaOption,
+  type QuickQaQuestion,
   type WhiteboardBoardTab,
   type WhiteboardEventBatchMessage,
   type WhiteboardIncrementalEvent,
@@ -41,6 +44,7 @@ const activeTab = ref<WhiteboardBoardTab>("teacher-board");
 const isTeacherBoardViewForced = ref(false);
 const modeVersion = ref(0);
 const tabVersion = ref(0);
+const quickQaQuestion = ref<QuickQaQuestion | null>(null);
 
 const teacherSnapshot = ref<WhiteboardSnapshot>(
   createEmptyWhiteboardSnapshot(),
@@ -70,6 +74,48 @@ const wsUrl = computed(() => {
   base.search = "?role=student";
   return base.toString();
 });
+
+const studentSelectedOption = computed<QuickQaOption | null>(() => {
+  if (!quickQaQuestion.value || !selfId) {
+    return null;
+  }
+
+  return quickQaQuestion.value.answersByStudent[selfId] ?? null;
+});
+const quickQaFeedback = computed(() => {
+  if (!quickQaQuestion.value || quickQaQuestion.value.status !== "closed") {
+    return "";
+  }
+
+  const selected = studentSelectedOption.value;
+  if (!selected) {
+    return "作答已結束";
+  }
+
+  if (!quickQaQuestion.value.correctOption) {
+    return "作答已結束";
+  }
+
+  return selected === quickQaQuestion.value.correctOption
+    ? "恭喜答對"
+    : "答錯再接再厲";
+});
+const quickQaAnswerDisabled = computed(
+  () => !quickQaQuestion.value || quickQaQuestion.value.status !== "open",
+);
+
+function optionBadgeColor(option: QuickQaOption): string {
+  switch (option) {
+    case "A":
+      return "primary";
+    case "B":
+      return "success";
+    case "C":
+      return "warning";
+    case "D":
+      return "error";
+  }
+}
 
 function sendSignal(payload: SignalEnvelope) {
   if (ws && ws.readyState === WebSocket.OPEN) {
@@ -194,6 +240,7 @@ function resetToJoinState(message = "連線已中斷，請重新加入") {
   teacherLastAppliedSequence.value = 0;
   teacherSnapshot.value = createEmptyWhiteboardSnapshot();
   studentSnapshot.value = createEmptyWhiteboardSnapshot();
+  quickQaQuestion.value = null;
   studentNextSequence = 1;
   teacherStudentLastAppliedSequence.value = 0;
   queuedStudentEvents.length = 0;
@@ -211,6 +258,18 @@ function resetToJoinState(message = "連線已中斷，請重新加入") {
   }
 
   statusText.value = message;
+}
+
+function submitQuickQaAnswer(option: QuickQaOption) {
+  if (!quickQaQuestion.value || quickQaQuestion.value.status !== "open") {
+    return;
+  }
+
+  sendLessonMessage({
+    kind: "quick-qa-answer-submit",
+    option,
+    submittedAt: Date.now(),
+  });
 }
 
 async function addCandidateSafely(candidate: RTCIceCandidateInit) {
@@ -571,6 +630,17 @@ function handleLessonMessage(raw: string) {
 
   if (parsed.kind === "student-open-url") {
     openTeacherAssignedUrl(parsed.url);
+    return;
+  }
+
+  if (parsed.kind === "quick-qa-state") {
+    quickQaQuestion.value = parsed.question
+      ? {
+          ...parsed.question,
+          options: { ...parsed.question.options },
+          answersByStudent: { ...parsed.question.answersByStudent },
+        }
+      : null;
   }
 }
 
@@ -676,104 +746,182 @@ onBeforeUnmount(() => {
 </script>
 
 <template>
-  <div class="student-view-root">
-    <div class="app-version-chip">{{ appVersionLabel }}</div>
-    <v-container
-      v-if="!isConnected || activeMode !== 'whiteboard'"
-      class="py-8"
-    >
-      <v-row justify="center">
-        <v-col cols="12" md="8" lg="7">
-          <NicknameJoinCard v-if="!isConnected" @submit="handleJoin" />
+  <v-app>
+    <v-app-bar title="song-class(學生端)">
+      <template #append>
+        <span class="app-version-text">{{ appVersionLabel }}</span>
+      </template>
+    </v-app-bar>
 
-          <v-card
-            v-else
-            rounded="xl"
-            elevation="8"
-            class="d-flex align-center justify-center py-16"
-          >
-            <v-card-text class="text-center">
-              <div class="text-h4 font-weight-black mb-2">請專心學習</div>
-              <div class="text-medium-emphasis">等待教師切換課堂功能</div>
-            </v-card-text>
+    <v-main class="student-main">
+      <v-container v-if="!isConnected || activeMode === 'home'" class="py-8">
+        <v-row justify="center">
+          <v-col cols="12" md="8" lg="7">
+            <NicknameJoinCard v-if="!isConnected" @submit="handleJoin" />
+
+            <v-card
+              v-else
+              rounded="xl"
+              elevation="8"
+              class="d-flex align-center justify-center py-16"
+            >
+              <v-card-text class="text-center">
+                <div class="text-h4 font-weight-black mb-2">請專心學習</div>
+                <div class="text-medium-emphasis">等待教師切換課堂功能</div>
+              </v-card-text>
+            </v-card>
+
+            <v-alert class="mt-4" type="info" variant="tonal">{{
+              statusText
+            }}</v-alert>
+            <v-alert
+              v-if="signalError"
+              class="mt-3"
+              type="error"
+              variant="tonal"
+              >{{ signalError }}</v-alert
+            >
+          </v-col>
+        </v-row>
+      </v-container>
+
+      <div
+        v-else-if="activeMode === 'quick-qa'"
+        class="student-quick-qa-screen"
+      >
+        <div class="student-quick-qa-shell">
+          <div class="student-quick-qa-heading">
+            <div class="text-h4 font-weight-black">快問快答</div>
+            <div class="text-body-2 text-medium-emphasis">請選擇你的答案</div>
+          </div>
+
+          <v-card rounded="xl" elevation="6" class="pa-3 pa-md-6">
+            <div class="text-medium-emphasis mb-4">
+              {{ quickQaQuestion?.question || "教師口頭敘述題目中..." }}
+            </div>
+
+            <v-row>
+              <v-col
+                v-for="option in QUICK_QA_OPTIONS"
+                :key="`student-quick-qa-${option}`"
+                cols="12"
+                sm="6"
+              >
+                <v-btn
+                  rounded="lg"
+                  block
+                  class="student-answer-btn"
+                  :color="optionBadgeColor(option)"
+                  :variant="studentSelectedOption === option ? 'flat' : 'tonal'"
+                  @click="submitQuickQaAnswer(option)"
+                >
+                  <div class="d-flex align-center ga-3 py-2 text-left w-100">
+                    <v-avatar color="white" size="42">
+                      <span class="font-weight-bold text-high-emphasis">{{
+                        option
+                      }}</span>
+                    </v-avatar>
+                    <div class="student-answer-btn-content">
+                      <div class="text-body-1 font-weight-bold text-wrap">
+                        {{
+                          quickQaQuestion?.options[option] || "等待教師口頭敘述"
+                        }}
+                      </div>
+                      <div class="text-caption mt-1">
+                        {{
+                          studentSelectedOption === option
+                            ? "已選擇"
+                            : "點擊作答"
+                        }}
+                      </div>
+                    </div>
+                    <v-icon
+                      v-if="studentSelectedOption === option"
+                      icon="mdi-check-circle"
+                      size="22"
+                      class="ml-auto"
+                    />
+                  </div>
+                </v-btn>
+              </v-col>
+            </v-row>
+
+            <v-alert
+              v-if="quickQaFeedback"
+              class="mt-4"
+              :type="quickQaFeedback === '恭喜答對' ? 'success' : 'info'"
+              variant="tonal"
+            >
+              {{ quickQaFeedback }}
+            </v-alert>
+
+            <div class="text-caption text-medium-emphasis mt-4">
+              <template v-if="quickQaAnswerDisabled">作答已結束</template>
+              <template v-else
+                >作答進行中，可隨時更換答案，系統以最後一次為準。</template
+              >
+            </div>
           </v-card>
-
-          <v-alert class="mt-4" type="info" variant="tonal">{{
-            statusText
-          }}</v-alert>
-          <v-alert
-            v-if="signalError"
-            class="mt-3"
-            type="error"
-            variant="tonal"
-            >{{ signalError }}</v-alert
-          >
-        </v-col>
-      </v-row>
-    </v-container>
-
-    <div v-else class="student-whiteboard-screen">
-      <v-tabs
-        color="primary"
-        density="compact"
-        :disabled="isTeacherBoardViewForced"
-        :model-value="activeTab"
-        @update:model-value="onStudentTabChanged"
-      >
-        <v-tab value="teacher-board">
-          <v-icon icon="mdi-account" start />
-          教師白板
-        </v-tab>
-        <v-tab value="student-board">
-          <v-icon icon="mdi-account-multiple" start />
-          學生白板
-        </v-tab>
-      </v-tabs>
-
-      <div
-        v-show="activeTab === 'teacher-board'"
-        class="student-whiteboard-canvas-wrap"
-      >
-        <WhiteboardCanvas
-          title="教師白板"
-          :snapshot="teacherSnapshot"
-          :show-toolbar="false"
-          class="student-whiteboard-canvas"
-        />
+        </div>
       </div>
 
-      <div
-        v-show="activeTab === 'student-board'"
-        class="student-whiteboard-canvas-wrap"
-      >
-        <WhiteboardCanvas
-          title="學生白板"
-          :snapshot="studentSnapshot"
-          class="student-whiteboard-canvas"
-          @update:snapshot="handleStudentSnapshot"
-          @sync-event="handleStudentSyncEvent"
-        />
+      <div v-else class="student-whiteboard-screen">
+        <v-tabs
+          color="primary"
+          density="compact"
+          :disabled="isTeacherBoardViewForced"
+          :model-value="activeTab"
+          @update:model-value="onStudentTabChanged"
+        >
+          <v-tab value="teacher-board">
+            <v-icon icon="mdi-account" start />
+            教師白板
+          </v-tab>
+          <v-tab value="student-board">
+            <v-icon icon="mdi-account-multiple" start />
+            學生白板
+          </v-tab>
+        </v-tabs>
+
+        <div
+          v-show="activeTab === 'teacher-board'"
+          class="student-whiteboard-canvas-wrap"
+        >
+          <WhiteboardCanvas
+            title="教師白板"
+            :snapshot="teacherSnapshot"
+            :show-toolbar="false"
+            class="student-whiteboard-canvas"
+          />
+        </div>
+
+        <div
+          v-show="activeTab === 'student-board'"
+          class="student-whiteboard-canvas-wrap"
+        >
+          <WhiteboardCanvas
+            title="學生白板"
+            :snapshot="studentSnapshot"
+            class="student-whiteboard-canvas"
+            @update:snapshot="handleStudentSnapshot"
+            @sync-event="handleStudentSyncEvent"
+          />
+        </div>
       </div>
-    </div>
-  </div>
+    </v-main>
+  </v-app>
 </template>
 
 <style scoped>
-.student-view-root {
-  position: relative;
-}
-
-.app-version-chip {
-  position: fixed;
-  top: 10px;
-  right: 14px;
-  z-index: 30;
-  padding: 2px 8px;
-  border-radius: 999px;
+.app-version-text {
   font-size: 0.75rem;
   color: rgba(var(--v-theme-on-surface), 0.72);
-  background: rgba(255, 255, 255, 0.72);
-  pointer-events: none;
+  white-space: nowrap;
+}
+
+.student-main {
+  height: calc(100vh - 64px);
+  overflow: hidden;
 }
 
 .student-whiteboard-screen {
@@ -795,5 +943,40 @@ onBeforeUnmount(() => {
 
 .student-whiteboard-canvas {
   height: 100%;
+}
+
+.student-quick-qa-screen {
+  min-height: 100dvh;
+  padding: 14px;
+}
+
+.student-quick-qa-shell {
+  max-width: 880px;
+  margin: 0 auto;
+}
+
+.student-quick-qa-heading {
+  margin-bottom: 12px;
+}
+
+.student-answer-btn {
+  min-height: 92px;
+  justify-content: flex-start;
+  text-transform: none;
+  letter-spacing: 0;
+}
+
+.student-answer-btn :deep(.v-btn__content) {
+  width: 100%;
+}
+
+.student-answer-btn-content {
+  min-width: 0;
+}
+
+@media (max-width: 960px) {
+  .student-quick-qa-shell {
+    max-width: 100%;
+  }
 }
 </style>

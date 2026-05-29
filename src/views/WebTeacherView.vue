@@ -14,10 +14,16 @@ import { useAppVersion } from "../composables/useAppVersion";
 import { createPeerConnection } from "../composables/usePeerConnection";
 import type { SignalEnvelope, StudentSession } from "../types/session";
 import {
+  QUICK_QA_OPTIONS,
   cloneWhiteboardSnapshot,
   cloneWhiteboardStroke,
+  createEmptyQuickQaOptions,
+  createQuickQaOptionStats,
   createEmptyWhiteboardSnapshot,
   isWhiteboardSyncMessage,
+  type QuickQaOption,
+  type QuickQaQuestion,
+  type QuickQaStateMessage,
   type WhiteboardBoardTab,
   type WhiteboardEventBatchMessage,
   type WhiteboardIncrementalEvent,
@@ -54,6 +60,25 @@ const activeWhiteboardTab = ref<WhiteboardBoardTab>("teacher-board");
 const forceTeacherBoardView = ref(false);
 const modeVersion = ref(0);
 const tabVersion = ref(0);
+const quickQaQuestionInput = ref("");
+const quickQaOptionInputs = reactive<Record<QuickQaOption, string>>(
+  createEmptyQuickQaOptions(),
+);
+const quickQaQuestion = ref<QuickQaQuestion | null>(null);
+const quickQaResultView = ref<"summary" | "details">("summary");
+const quickQaCorrectOptionChoice = ref<QuickQaOption | "none">("none");
+const quickQaStageCorrectCounts = reactive(new Map<string, number>());
+const quickQaCorrectOptionItems: Array<{
+  title: string;
+  value: QuickQaOption | "none";
+}> = [
+  { title: "不設定正確答案", value: "none" },
+  ...QUICK_QA_OPTIONS.map((option) => ({
+    title: `答案 ${option}`,
+    value: option,
+  })),
+];
+const knownStudentNames = reactive(new Map<string, string>());
 
 const whiteboardBackgroundOptions = [
   { fileName: null, displayName: "空白" },
@@ -100,6 +125,43 @@ const wsUrl = computed(() => {
   base.pathname = "/ws";
   base.search = "?role=teacher";
   return base.toString();
+});
+
+const quickQaStats = computed(() =>
+  createQuickQaOptionStats(quickQaQuestion.value),
+);
+const quickQaTotalAnswers = computed(
+  () => Object.keys(quickQaQuestion.value?.answersByStudent ?? {}).length,
+);
+const quickQaIsOpen = computed(() => quickQaQuestion.value?.status === "open");
+const quickQaCanClose = computed(
+  () =>
+    quickQaQuestion.value !== null && quickQaQuestion.value.status === "open",
+);
+const quickQaHasQuestion = computed(() => quickQaQuestion.value !== null);
+const quickQaDetailsByOption = computed(() =>
+  quickQaStats.value.map((stat) => ({
+    ...stat,
+    students: stat.studentIds.map((studentId) => ({
+      id: studentId,
+      nickname: getStudentDisplayName(studentId),
+    })),
+  })),
+);
+const quickQaLeaderboardTop10 = computed(() => {
+  return [...quickQaStageCorrectCounts.entries()]
+    .map(([studentId, score]) => ({
+      studentId,
+      nickname: getStudentDisplayName(studentId),
+      score,
+    }))
+    .sort((left, right) => {
+      if (right.score !== left.score) {
+        return right.score - left.score;
+      }
+      return left.nickname.localeCompare(right.nickname, "zh-Hant");
+    })
+    .slice(0, 10);
 });
 
 const teacherBackgroundImage = computed(() => teacherBackground.value);
@@ -287,6 +349,112 @@ function toStudentViewControlMessage(): WhiteboardStudentViewControlMessage {
   };
 }
 
+function toQuickQaStateMessage(
+  reason: QuickQaStateMessage["reason"],
+): QuickQaStateMessage {
+  return {
+    kind: "quick-qa-state",
+    reason,
+    question: quickQaQuestion.value
+      ? {
+          ...quickQaQuestion.value,
+          options: { ...quickQaQuestion.value.options },
+          answersByStudent: { ...quickQaQuestion.value.answersByStudent },
+        }
+      : null,
+  };
+}
+
+function getStudentDisplayName(studentId: string): string {
+  return (
+    students.value.find((student) => student.connection_id === studentId)
+      ?.nickname ??
+    knownStudentNames.get(studentId) ??
+    studentId
+  );
+}
+
+function publishQuickQaQuestion() {
+  const now = Date.now();
+  quickQaQuestion.value = {
+    id: `qq-${now}`,
+    question: quickQaQuestionInput.value.trim(),
+    options: {
+      A: quickQaOptionInputs.A.trim(),
+      B: quickQaOptionInputs.B.trim(),
+      C: quickQaOptionInputs.C.trim(),
+      D: quickQaOptionInputs.D.trim(),
+    },
+    status: "open",
+    publishedAt: now,
+    closedAt: null,
+    correctOption: null,
+    answersByStudent: {},
+  };
+
+  quickQaCorrectOptionChoice.value = "none";
+  quickQaResultView.value = "summary";
+  applyFeatureMode("quick-qa");
+  broadcastToLessonChannels(toQuickQaStateMessage("publish"));
+}
+
+function clearQuickQaDraft() {
+  quickQaQuestionInput.value = "";
+  for (const option of QUICK_QA_OPTIONS) {
+    quickQaOptionInputs[option] = "";
+  }
+}
+
+function resetQuickQaStageLeaderboard() {
+  quickQaStageCorrectCounts.clear();
+}
+
+function closeQuickQaQuestion() {
+  if (!quickQaQuestion.value || quickQaQuestion.value.status === "closed") {
+    return;
+  }
+
+  const closedAt = Date.now();
+  const correctOption =
+    quickQaCorrectOptionChoice.value === "none"
+      ? null
+      : quickQaCorrectOptionChoice.value;
+  const finalAnswers = { ...quickQaQuestion.value.answersByStudent };
+
+  if (correctOption) {
+    for (const [studentId, selectedOption] of Object.entries(finalAnswers)) {
+      if (selectedOption !== correctOption) {
+        continue;
+      }
+      const currentScore = quickQaStageCorrectCounts.get(studentId) ?? 0;
+      quickQaStageCorrectCounts.set(studentId, currentScore + 1);
+    }
+  }
+
+  quickQaQuestion.value = {
+    ...quickQaQuestion.value,
+    status: "closed",
+    correctOption,
+    closedAt,
+    answersByStudent: finalAnswers,
+  };
+
+  broadcastToLessonChannels(toQuickQaStateMessage("close"));
+}
+
+function optionBadgeColor(option: QuickQaOption): string {
+  switch (option) {
+    case "A":
+      return "primary";
+    case "B":
+      return "success";
+    case "C":
+      return "warning";
+    case "D":
+      return "error";
+  }
+}
+
 function openStudentCoeditDialog(studentId: string) {
   const student = students.value.find(
     (item) => item.connection_id === studentId,
@@ -370,6 +538,7 @@ function pushBootstrapToStudent(studentId: string) {
     toTeacherStudentSnapshotMessage(studentId, "join"),
   );
   sendToStudentChannel(studentId, toStudentViewControlMessage());
+  sendToStudentChannel(studentId, toQuickQaStateMessage("join"));
 }
 
 function flushQueuedTeacherEvents() {
@@ -570,6 +739,13 @@ function activateWhiteboard() {
   applyFeatureMode("whiteboard");
 }
 
+function activateQuickQa() {
+  if (activeFeature.value !== "quick-qa") {
+    resetQuickQaStageLeaderboard();
+  }
+  applyFeatureMode("quick-qa");
+}
+
 function activateTeacherBoardTab() {
   applyWhiteboardTab("teacher-board");
 }
@@ -767,6 +943,23 @@ function handleChannelMessage(studentId: string, raw: string) {
       return;
     }
 
+    if (parsed.kind === "quick-qa-answer-submit") {
+      if (!quickQaQuestion.value || quickQaQuestion.value.status !== "open") {
+        return;
+      }
+
+      quickQaQuestion.value = {
+        ...quickQaQuestion.value,
+        answersByStudent: {
+          ...quickQaQuestion.value.answersByStudent,
+          [studentId]: parsed.option,
+        },
+      };
+
+      broadcastToLessonChannels(toQuickQaStateMessage("answer-update"));
+      return;
+    }
+
     if (parsed.kind === "snapshot-request") {
       const request = parsed as WhiteboardSnapshotRequestMessage;
       if (request.boardTab === "teacher-board") {
@@ -933,6 +1126,10 @@ function disposeStudentConnection(studentId: string) {
 }
 
 function reconcileStudentConnections(nextStudents: StudentSession[]) {
+  for (const student of nextStudents) {
+    knownStudentNames.set(student.connection_id, student.nickname);
+  }
+
   const activeIds = new Set(
     nextStudents.map((student) => student.connection_id),
   );
@@ -1127,6 +1324,13 @@ onBeforeUnmount(() => {
         >
           小白版
         </v-btn>
+        <v-btn
+          color="indigo"
+          :variant="activeFeature === 'quick-qa' ? 'flat' : 'outlined'"
+          @click="activateQuickQa"
+        >
+          快問快答
+        </v-btn>
         <v-btn color="info" variant="tonal" @click="openStudentUrlDialog">
           學生開啟網頁
         </v-btn>
@@ -1256,6 +1460,257 @@ onBeforeUnmount(() => {
           </v-card>
         </div>
 
+        <div v-else-if="activeFeature === 'quick-qa'" class="quick-qa-layout">
+          <v-card rounded="lg" variant="outlined" class="quick-qa-editor-card">
+            <v-card-title class="d-flex align-center justify-space-between">
+              <span class="text-h6">發布新問題</span>
+              <v-chip color="warning" variant="flat" size="small"
+                >Step 1 of 2</v-chip
+              >
+            </v-card-title>
+            <v-card-text class="d-flex flex-column ga-4">
+              <v-textarea
+                v-model="quickQaQuestionInput"
+                label="題目內容"
+                variant="outlined"
+                auto-grow
+                rows="3"
+                hint="可留白，改用口頭敘述"
+                persistent-hint
+              />
+
+              <div
+                v-for="option in QUICK_QA_OPTIONS"
+                :key="option"
+                class="d-flex align-center ga-3"
+              >
+                <v-avatar :color="optionBadgeColor(option)" size="34">
+                  <span class="text-white font-weight-bold">{{ option }}</span>
+                </v-avatar>
+                <v-text-field
+                  v-model="quickQaOptionInputs[option]"
+                  :label="`${option} 選項內容`"
+                  variant="outlined"
+                  density="comfortable"
+                  hide-details
+                  placeholder="可留白，改用口頭敘述"
+                />
+              </div>
+
+              <div class="d-flex align-center ga-3 mt-2">
+                <v-btn
+                  color="primary"
+                  size="large"
+                  prepend-icon="mdi-send"
+                  @click="publishQuickQaQuestion"
+                >
+                  發布題目
+                </v-btn>
+
+                <v-btn
+                  color="secondary"
+                  size="large"
+                  variant="outlined"
+                  prepend-icon="mdi-eraser"
+                  @click="clearQuickQaDraft"
+                >
+                  清除題目與選項
+                </v-btn>
+
+                <v-btn
+                  color="error"
+                  size="large"
+                  variant="outlined"
+                  :disabled="!quickQaCanClose"
+                  prepend-icon="mdi-stop-circle-outline"
+                  @click="closeQuickQaQuestion"
+                >
+                  結束作答
+                </v-btn>
+
+                <v-select
+                  v-model="quickQaCorrectOptionChoice"
+                  :items="quickQaCorrectOptionItems"
+                  item-title="title"
+                  item-value="value"
+                  label="正確答案（可不選）"
+                  variant="outlined"
+                  density="comfortable"
+                  hide-details
+                  class="quick-qa-correct-select"
+                />
+              </div>
+            </v-card-text>
+          </v-card>
+
+          <div class="quick-qa-right-panel d-flex flex-column ga-3">
+            <v-card
+              rounded="lg"
+              variant="outlined"
+              class="quick-qa-result-card"
+            >
+              <v-card-title class="d-flex align-center justify-space-between">
+                <span class="text-h6">即時數據</span>
+                <v-chip
+                  :color="quickQaIsOpen ? 'success' : 'primary'"
+                  variant="tonal"
+                  size="small"
+                >
+                  {{ quickQaIsOpen ? "Live" : "Closed" }}
+                </v-chip>
+              </v-card-title>
+              <v-card-text
+                v-if="quickQaHasQuestion"
+                class="d-flex flex-column ga-3"
+              >
+                <v-card variant="tonal" color="primary" rounded="lg">
+                  <v-card-text class="py-3">
+                    <div class="text-caption text-medium-emphasis">
+                      參與人數
+                    </div>
+                    <div class="text-h4 font-weight-black">
+                      {{ quickQaTotalAnswers }}/{{ students.length }}
+                    </div>
+                  </v-card-text>
+                </v-card>
+
+                <v-tabs
+                  density="compact"
+                  color="primary"
+                  :model-value="quickQaResultView"
+                  @update:model-value="
+                    quickQaResultView = $event as 'summary' | 'details'
+                  "
+                >
+                  <v-tab value="summary">統計</v-tab>
+                  <v-tab value="details">明細</v-tab>
+                </v-tabs>
+
+                <div
+                  v-if="quickQaResultView === 'summary'"
+                  class="d-flex flex-column ga-2"
+                >
+                  <v-card
+                    v-for="stat in quickQaStats"
+                    :key="`summary-${stat.option}`"
+                    rounded="lg"
+                    variant="tonal"
+                  >
+                    <v-card-text class="py-2">
+                      <div class="d-flex align-center justify-space-between">
+                        <div class="d-flex align-center ga-2">
+                          <v-chip
+                            :color="optionBadgeColor(stat.option)"
+                            size="small"
+                            variant="flat"
+                          >
+                            {{ stat.option }}
+                          </v-chip>
+                          <span class="font-weight-bold"
+                            >{{ stat.count }} 票</span
+                          >
+                        </div>
+                        <span class="text-medium-emphasis"
+                          >{{ stat.percentage }}%</span
+                        >
+                      </div>
+                      <v-progress-linear
+                        class="mt-2"
+                        rounded
+                        :model-value="stat.percentage"
+                        :color="optionBadgeColor(stat.option)"
+                        height="8"
+                      />
+                    </v-card-text>
+                  </v-card>
+                </div>
+
+                <div v-else class="d-flex flex-column ga-2">
+                  <v-card
+                    v-for="optionGroup in quickQaDetailsByOption"
+                    :key="`detail-${optionGroup.option}`"
+                    rounded="lg"
+                    variant="outlined"
+                  >
+                    <v-card-title
+                      class="py-2 text-subtitle-1 d-flex align-center ga-2"
+                    >
+                      <v-chip
+                        :color="optionBadgeColor(optionGroup.option)"
+                        size="small"
+                        variant="flat"
+                      >
+                        {{ optionGroup.option }}
+                      </v-chip>
+                      <span>{{ optionGroup.count }} 人</span>
+                    </v-card-title>
+                    <v-card-text class="pt-0">
+                      <v-list
+                        v-if="optionGroup.students.length > 0"
+                        density="compact"
+                        class="pa-0"
+                      >
+                        <v-list-item
+                          v-for="student in optionGroup.students"
+                          :key="`detail-${optionGroup.option}-${student.id}`"
+                          :title="student.nickname"
+                        />
+                      </v-list>
+                      <div v-else class="text-body-2 text-medium-emphasis">
+                        尚無作答
+                      </div>
+                    </v-card-text>
+                  </v-card>
+                </div>
+              </v-card-text>
+
+              <v-card-text v-else class="text-medium-emphasis">
+                尚未發布題目
+              </v-card-text>
+            </v-card>
+
+            <v-card
+              rounded="lg"
+              variant="outlined"
+              class="quick-qa-leaderboard-card"
+            >
+              <v-card-title class="d-flex align-center justify-space-between">
+                <span class="text-h6">階段排行榜</span>
+                <v-chip size="small" variant="tonal" color="primary"
+                  >Top 10</v-chip
+                >
+              </v-card-title>
+              <v-card-text>
+                <v-list
+                  v-if="quickQaLeaderboardTop10.length > 0"
+                  density="compact"
+                  class="pa-0"
+                >
+                  <v-list-item
+                    v-for="(entry, index) in quickQaLeaderboardTop10"
+                    :key="entry.studentId"
+                  >
+                    <template #prepend>
+                      <v-avatar size="28" color="primary" variant="tonal">
+                        {{ index + 1 }}
+                      </v-avatar>
+                    </template>
+                    <v-list-item-title>{{ entry.nickname }}</v-list-item-title>
+                    <template #append>
+                      <v-chip color="success" size="small" variant="flat"
+                        >{{ entry.score }} 題</v-chip
+                      >
+                    </template>
+                  </v-list-item>
+                </v-list>
+                <div v-else class="text-body-2 text-medium-emphasis">
+                  尚無排行榜資料
+                </div>
+              </v-card-text>
+            </v-card>
+          </div>
+        </div>
+
         <v-card
           v-else
           rounded="xl"
@@ -1366,6 +1821,33 @@ onBeforeUnmount(() => {
   gap: 12px;
 }
 
+.quick-qa-layout {
+  height: 100%;
+  min-height: 0;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 320px;
+  gap: 12px;
+}
+
+.quick-qa-editor-card,
+.quick-qa-result-card {
+  height: 100%;
+  overflow: auto;
+}
+
+.quick-qa-right-panel {
+  min-height: 0;
+}
+
+.quick-qa-leaderboard-card {
+  max-height: 56%;
+  overflow: auto;
+}
+
+.quick-qa-correct-select {
+  min-width: 220px;
+}
+
 .whiteboard-canvas-wrap {
   min-width: 0;
   min-height: 0;
@@ -1437,6 +1919,11 @@ onBeforeUnmount(() => {
   .whiteboard-layout {
     grid-template-columns: 1fr;
     grid-template-rows: minmax(0, 1fr) auto;
+  }
+
+  .quick-qa-layout {
+    grid-template-columns: 1fr;
+    grid-template-rows: auto minmax(0, 1fr);
   }
 
   .image-tools-panel {

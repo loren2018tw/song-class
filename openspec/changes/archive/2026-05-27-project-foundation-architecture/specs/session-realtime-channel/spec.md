@@ -40,9 +40,9 @@
 
 ### Requirement: 教師端與學生端 WebRTC 必須由瀏覽器端承擔
 
-系統 MUST 讓教師端與學生端在一般瀏覽器中建立 WebRTC，不以 Tauri WebView 作為必要的 WebRTC 端點。
+系統 MUST 讓教師端與學生端在一般瀏覽器中建立 WebRTC，不以主程式內嵌視圖作為必要的 WebRTC 端點。
 
-#### Scenario: Tauri WebView 缺少 RTCPeerConnection
+#### Scenario: 主程式內嵌視圖缺少 RTCPeerConnection
 
-- **WHEN** Tauri 主控台所在 WebView 不支援 RTCPeerConnection
+- **WHEN** 主程式控制台內嵌視圖不支援 RTCPeerConnection
 - **THEN** 系統 MUST 仍可透過瀏覽器教師端頁面完成與學生端的 WebRTC 連線

@@ -13,8 +13,39 @@ export const WHITEBOARD_SIZE_OPTIONS = [4, 8, 12, 16, 24] as const;
 
 export type WhiteboardTool = "pen" | "eraser";
 export type WhiteboardColor = (typeof WHITEBOARD_COLOR_OPTIONS)[number];
-export type WhiteboardMode = "home" | "whiteboard";
+export type WhiteboardMode = "home" | "whiteboard" | "quick-qa";
 export type WhiteboardBoardTab = "teacher-board" | "student-board";
+export type QuickQaOption = "A" | "B" | "C" | "D";
+
+export interface QuickQaQuestion {
+  id: string;
+  question: string;
+  options: Record<QuickQaOption, string>;
+  status: "open" | "closed";
+  publishedAt: number;
+  closedAt: number | null;
+  correctOption: QuickQaOption | null;
+  answersByStudent: Record<string, QuickQaOption>;
+}
+
+export interface QuickQaOptionStat {
+  option: QuickQaOption;
+  count: number;
+  percentage: number;
+  studentIds: string[];
+}
+
+export interface QuickQaStateMessage {
+  kind: "quick-qa-state";
+  reason: "join" | "publish" | "answer-update" | "close";
+  question: QuickQaQuestion | null;
+}
+
+export interface QuickQaAnswerSubmitMessage {
+  kind: "quick-qa-answer-submit";
+  option: QuickQaOption;
+  submittedAt: number;
+}
 
 export interface WhiteboardPoint {
   x: number;
@@ -181,7 +212,40 @@ export type WhiteboardSyncMessage =
   | WhiteboardTeacherStudentSnapshotMessage
   | WhiteboardStudentBoardControlMessage
   | WhiteboardStudentViewControlMessage
-  | WhiteboardStudentOpenUrlMessage;
+  | WhiteboardStudentOpenUrlMessage
+  | QuickQaStateMessage
+  | QuickQaAnswerSubmitMessage;
+
+export const QUICK_QA_OPTIONS: QuickQaOption[] = ["A", "B", "C", "D"];
+
+export function createEmptyQuickQaOptions(): Record<QuickQaOption, string> {
+  return {
+    A: "",
+    B: "",
+    C: "",
+    D: "",
+  };
+}
+
+export function createQuickQaOptionStats(
+  question: QuickQaQuestion | null,
+): QuickQaOptionStat[] {
+  const answers = question ? Object.entries(question.answersByStudent) : [];
+  const total = answers.length;
+
+  return QUICK_QA_OPTIONS.map((option) => {
+    const studentIds = answers
+      .filter((entry) => entry[1] === option)
+      .map((entry) => entry[0]);
+    const count = studentIds.length;
+    return {
+      option,
+      count,
+      percentage: total === 0 ? 0 : Math.round((count / total) * 100),
+      studentIds,
+    };
+  });
+}
 
 export function cloneWhiteboardStroke(
   stroke: WhiteboardStroke,
@@ -227,7 +291,9 @@ export function isWhiteboardSyncMessage(
     kind === "teacher-student-snapshot" ||
     kind === "student-board-control" ||
     kind === "student-view-control" ||
-    kind === "student-open-url"
+    kind === "student-open-url" ||
+    kind === "quick-qa-state" ||
+    kind === "quick-qa-answer-submit"
   );
 }
 
