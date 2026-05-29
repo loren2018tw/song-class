@@ -22,9 +22,8 @@ import {
   type WhiteboardSnapshotRequestMessage,
   type WhiteboardStudentEventBatchMessage,
   type WhiteboardTeacherStudentEventBatchMessage,
-  type WhiteboardTeacherStudentResyncRequestMessage,
-  type WhiteboardTeacherStudentSnapshotMessage,
   type WhiteboardSyncMessage,
+  type WhiteboardTeacherBoardControlMessage,
 } from "../types/whiteboard";
 
 const props = defineProps<{
@@ -141,17 +140,6 @@ function requestTeacherSnapshot(
   });
 }
 
-function requestTeacherStudentSnapshot(
-  reason: WhiteboardTeacherStudentResyncRequestMessage["reason"],
-) {
-  sendLessonMessage({
-    kind: "teacher-student-resync-request",
-    boardTab: "student-board",
-    reason,
-    sinceSeq: teacherStudentLastAppliedSequence.value,
-  });
-}
-
 function stopStudentBatchTimer() {
   if (studentBatchFlushTimer !== null) {
     window.clearTimeout(studentBatchFlushTimer);
@@ -198,6 +186,14 @@ function enqueueStudentEvent(payload: WhiteboardIncrementalEventPayload) {
   ) {
     return;
   }
+
+  const nextSnapshot = cloneWhiteboardSnapshot(studentSnapshot.value);
+  applyIncrementalEvent(nextSnapshot, {
+    ...payload,
+    seq: studentNextSequence,
+    timestamp: Date.now(),
+  });
+  studentSnapshot.value = nextSnapshot;
 
   queuedStudentEvents.push({
     ...payload,
@@ -446,7 +442,7 @@ function applyTeacherStudentBatch(
 ) {
   const expectedStart = teacherStudentLastAppliedSequence.value + 1;
   if (message.startSeq !== expectedStart) {
-    requestTeacherStudentSnapshot("seq-gap");
+    // 共編學生白板採純事件流；遇到序號缺口時僅略過此批，等待後續事件。
     return;
   }
 
@@ -456,7 +452,6 @@ function applyTeacherStudentBatch(
     let expectedSeq = expectedStart;
     for (const event of message.events) {
       if (event.seq !== expectedSeq) {
-        requestTeacherStudentSnapshot("seq-gap");
         return;
       }
 
@@ -464,12 +459,21 @@ function applyTeacherStudentBatch(
       expectedSeq += 1;
     }
   } catch {
-    requestTeacherStudentSnapshot("seq-gap");
     return;
   }
 
   studentSnapshot.value = nextSnapshot;
   teacherStudentLastAppliedSequence.value = message.endSeq;
+}
+
+function mergeTeacherSnapshotWithoutBackground(
+  currentSnapshot: WhiteboardSnapshot,
+  incomingSnapshot: WhiteboardSnapshot,
+) {
+  const nextSnapshot = cloneWhiteboardSnapshot(incomingSnapshot);
+  nextSnapshot.backgroundImage = currentSnapshot.backgroundImage ?? null;
+  nextSnapshot.backgroundColor = currentSnapshot.backgroundColor;
+  return nextSnapshot;
 }
 
 function openTeacherAssignedUrl(rawUrl: string) {
@@ -533,25 +537,41 @@ function handleLessonMessage(raw: string) {
     tabVersion.value = parsed.tabVersion;
 
     if (parsed.boardTab === "teacher-board") {
-      teacherSnapshot.value = cloneWhiteboardSnapshot(parsed.snapshot);
+      teacherSnapshot.value = mergeTeacherSnapshotWithoutBackground(
+        teacherSnapshot.value,
+        parsed.snapshot,
+      );
       teacherLastAppliedSequence.value = parsed.seq;
       return;
     }
 
     if (parsed.boardTab === "student-board") {
-      studentSnapshot.value = cloneWhiteboardSnapshot(parsed.snapshot);
+      // 學生白板共編不套用快照，避免覆蓋本地事件流。
       return;
     }
   }
 
-  if (parsed.kind === "teacher-student-snapshot") {
-    const message = parsed as WhiteboardTeacherStudentSnapshotMessage;
-    if (message.boardTab !== "student-board") {
+  if (parsed.kind === "teacher-board-control") {
+    const message = parsed as WhiteboardTeacherBoardControlMessage;
+    if (
+      message.modeVersion < modeVersion.value ||
+      message.tabVersion < tabVersion.value
+    ) {
       return;
     }
 
-    studentSnapshot.value = cloneWhiteboardSnapshot(message.snapshot);
-    teacherStudentLastAppliedSequence.value = message.seq;
+    modeVersion.value = message.modeVersion;
+    tabVersion.value = message.tabVersion;
+
+    if (message.action === "set-background") {
+      teacherSnapshot.value = {
+        ...cloneWhiteboardSnapshot(teacherSnapshot.value),
+        backgroundImage: message.backgroundImage ?? null,
+        backgroundColor:
+          message.backgroundColor ?? teacherSnapshot.value.backgroundColor,
+      };
+    }
+
     return;
   }
 
@@ -652,7 +672,6 @@ function bindLessonChannel(channel: RTCDataChannel) {
     statusText.value = "已連線，請專心學習";
     signalError.value = "";
     requestTeacherSnapshot("join-init");
-    requestTeacherStudentSnapshot("join-init");
   };
 
   lessonChannel.onmessage = (event) => {
@@ -670,10 +689,6 @@ function bindLessonChannel(channel: RTCDataChannel) {
   lessonChannel.onerror = () => {
     signalError.value = "資料通道發生錯誤";
   };
-}
-
-function handleStudentSnapshot(snapshot: WhiteboardSnapshot) {
-  studentSnapshot.value = cloneWhiteboardSnapshot(snapshot);
 }
 
 function handleStudentSyncEvent(payload: WhiteboardIncrementalEventPayload) {
@@ -903,7 +918,6 @@ onBeforeUnmount(() => {
             title="學生白板"
             :snapshot="studentSnapshot"
             class="student-whiteboard-canvas"
-            @update:snapshot="handleStudentSnapshot"
             @sync-event="handleStudentSyncEvent"
           />
         </div>

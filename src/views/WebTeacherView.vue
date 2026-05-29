@@ -33,11 +33,10 @@ import {
   type WhiteboardSnapshot,
   type WhiteboardSnapshotRequestMessage,
   type WhiteboardSnapshotSyncMessage,
+  type WhiteboardTeacherBoardControlMessage,
   type WhiteboardStudentBoardControlMessage,
   type WhiteboardStudentEventBatchMessage,
   type WhiteboardTeacherStudentEventBatchMessage,
-  type WhiteboardTeacherStudentResyncRequestMessage,
-  type WhiteboardTeacherStudentSnapshotMessage,
   type WhiteboardStudentViewControlMessage,
   type WhiteboardSyncMessage,
 } from "../types/whiteboard";
@@ -90,6 +89,17 @@ const whiteboardBackgroundOptions = [
 
 const teacherBackground = ref<string | null>(null);
 const studentBackground = ref<string | null>(null);
+
+type WhiteboardCanvasExposed = {
+  getFlattenedDrawingLayer: () => {
+    imageDataUrl: string;
+    width: number;
+    height: number;
+    updatedAt: number;
+  } | null;
+};
+
+const teacherWhiteboardCanvasRef = ref<WhiteboardCanvasExposed | null>(null);
 
 const teacherWhiteboardSnapshot = ref<WhiteboardSnapshot>(
   createEmptyWhiteboardSnapshot(),
@@ -286,6 +296,9 @@ function toModeMessage(): WhiteboardModeSyncMessage {
 function toTeacherSnapshotMessage(
   reason: WhiteboardSnapshotSyncMessage["reason"],
 ): WhiteboardSnapshotSyncMessage {
+  const snapshot = cloneWhiteboardSnapshot(teacherWhiteboardSnapshot.value);
+  snapshot.backgroundImage = null;
+
   return {
     kind: "whiteboard-snapshot",
     modeVersion: modeVersion.value,
@@ -293,22 +306,7 @@ function toTeacherSnapshotMessage(
     boardTab: "teacher-board",
     seq: Math.max(0, nextTeacherSequence - 1),
     reason,
-    snapshot: cloneWhiteboardSnapshot(teacherWhiteboardSnapshot.value),
-  };
-}
-
-function toTeacherStudentSnapshotMessage(
-  studentId: string,
-  reason: WhiteboardTeacherStudentSnapshotMessage["reason"],
-): WhiteboardTeacherStudentSnapshotMessage {
-  return {
-    kind: "teacher-student-snapshot",
-    boardTab: "student-board",
-    seq: teacherToStudentLastSequence.get(studentId) ?? 0,
-    reason,
-    snapshot: cloneWhiteboardSnapshot(
-      studentBoardSnapshots.get(studentId) ?? createEmptyWhiteboardSnapshot(),
-    ),
+    snapshot,
   };
 }
 
@@ -331,14 +329,17 @@ function toStudentBoardBackgroundMessage(
   };
 }
 
-function toPushTeacherStrokesMessage(): WhiteboardStudentBoardControlMessage {
+function toTeacherBoardBackgroundMessage(
+  backgroundImage: string | null,
+  backgroundColor: string,
+): WhiteboardTeacherBoardControlMessage {
   return {
-    kind: "student-board-control",
-    action: "replace-strokes",
+    kind: "teacher-board-control",
+    action: "set-background",
+    modeVersion: modeVersion.value,
     tabVersion: tabVersion.value,
-    strokes: teacherWhiteboardSnapshot.value.strokes.map((stroke) =>
-      cloneWhiteboardStroke(stroke),
-    ),
+    backgroundImage,
+    backgroundColor,
   };
 }
 
@@ -535,7 +536,10 @@ function pushBootstrapToStudent(studentId: string) {
   sendToStudentChannel(studentId, toTeacherSnapshotMessage("join"));
   sendToStudentChannel(
     studentId,
-    toTeacherStudentSnapshotMessage(studentId, "join"),
+    toTeacherBoardBackgroundMessage(
+      teacherWhiteboardSnapshot.value.backgroundImage ?? null,
+      teacherWhiteboardSnapshot.value.backgroundColor,
+    ),
   );
   sendToStudentChannel(studentId, toStudentViewControlMessage());
   sendToStudentChannel(studentId, toQuickQaStateMessage("join"));
@@ -798,6 +802,16 @@ function handleTeacherWhiteboardSnapshot(snapshot: WhiteboardSnapshot) {
 function handleTeacherWhiteboardSyncEvent(
   payload: WhiteboardIncrementalEventPayload,
 ) {
+  if (payload.type === "background-change") {
+    broadcastToLessonChannels(
+      toTeacherBoardBackgroundMessage(
+        payload.backgroundImage ?? null,
+        payload.backgroundColor,
+      ),
+    );
+    return;
+  }
+
   enqueueTeacherIncrementalEvent(payload);
 }
 
@@ -831,7 +845,8 @@ function applyIncrementalEvent(
     case "stroke-point": {
       const stroke = ensureStroke(snapshot, event);
       if (!stroke) {
-        throw new Error("missing-stroke");
+        // 在不保證事件完整順序的模式下，缺少對應筆劃時直接略過該點。
+        break;
       }
       stroke.points.push({ x: event.point.x, y: event.point.y });
       break;
@@ -874,33 +889,12 @@ function processStudentBatch(
   studentId: string,
   message: WhiteboardStudentEventBatchMessage,
 ) {
-  const expectedStart = (studentBoardLastSequence.get(studentId) ?? 0) + 1;
-  if (message.startSeq !== expectedStart) {
-    resetStudentBoardState(studentId);
-    showRtcError(`學生 ${studentId} 白板序號不連續，已重置該學生白板`);
-    return;
-  }
-
   const baseSnapshot =
     studentBoardSnapshots.get(studentId) ?? createEmptyWhiteboardSnapshot();
   const nextSnapshot = cloneWhiteboardSnapshot(baseSnapshot);
 
-  try {
-    let expectedSeq = expectedStart;
-    for (const event of message.events) {
-      if (event.seq !== expectedSeq) {
-        resetStudentBoardState(studentId);
-        showRtcError(`學生 ${studentId} 白板事件序號異常，已重置該學生白板`);
-        return;
-      }
-
-      applyIncrementalEvent(nextSnapshot, event);
-      expectedSeq += 1;
-    }
-  } catch {
-    resetStudentBoardState(studentId);
-    showRtcError(`學生 ${studentId} 白板事件重播失敗，已重置該學生白板`);
-    return;
+  for (const event of message.events) {
+    applyIncrementalEvent(nextSnapshot, event);
   }
 
   setStudentSnapshot(studentId, nextSnapshot);
@@ -916,8 +910,14 @@ function clearAllStudentBoards() {
 }
 
 function pushTeacherDrawingToStudentBoards() {
-  const teacherStrokes = teacherWhiteboardSnapshot.value.strokes.map((stroke) =>
-    cloneWhiteboardStroke(stroke),
+  const flattenedDrawingLayer =
+    teacherWhiteboardCanvasRef.value?.getFlattenedDrawingLayer() ?? null;
+  if (!flattenedDrawingLayer) {
+    showRtcError("教師白板壓平資料取得失敗");
+  }
+
+  const teacherSnapshot = cloneWhiteboardSnapshot(
+    teacherWhiteboardSnapshot.value,
   );
 
   for (const student of students.value) {
@@ -927,13 +927,24 @@ function pushTeacherDrawingToStudentBoards() {
 
     setStudentSnapshot(student.connection_id, {
       ...cloneWhiteboardSnapshot(currentSnapshot),
-      strokes: teacherStrokes.map((stroke) => cloneWhiteboardStroke(stroke)),
+      strokes: teacherSnapshot.strokes.map((stroke) =>
+        cloneWhiteboardStroke(stroke),
+      ),
     });
 
     studentBoardLastSequence.set(student.connection_id, 0);
+    teacherToStudentLastSequence.set(student.connection_id, 0);
+    teacherToStudentNextSequence.set(student.connection_id, 1);
+    queuedTeacherToStudentEvents.set(student.connection_id, []);
+    sendToStudentChannel(student.connection_id, {
+      kind: "student-board-control",
+      action: "replace-strokes",
+      tabVersion: tabVersion.value,
+      strokes: teacherSnapshot.strokes.map((stroke) =>
+        cloneWhiteboardStroke(stroke),
+      ),
+    });
   }
-
-  broadcastToLessonChannels(toPushTeacherStrokesMessage());
 }
 
 function handleChannelMessage(studentId: string, raw: string) {
@@ -965,31 +976,16 @@ function handleChannelMessage(studentId: string, raw: string) {
       if (request.boardTab === "teacher-board") {
         const reason = request.reason === "join-init" ? "join" : "resync";
         sendToStudentChannel(studentId, toTeacherSnapshotMessage(reason));
-        return;
-      }
-
-      if (request.boardTab === "student-board") {
-        const reason = request.reason === "join-init" ? "join" : "resync";
         sendToStudentChannel(
           studentId,
-          toTeacherStudentSnapshotMessage(studentId, reason),
+          toTeacherBoardBackgroundMessage(
+            teacherWhiteboardSnapshot.value.backgroundImage ?? null,
+            teacherWhiteboardSnapshot.value.backgroundColor,
+          ),
         );
-      }
-
-      return;
-    }
-
-    if (parsed.kind === "teacher-student-resync-request") {
-      const request = parsed as WhiteboardTeacherStudentResyncRequestMessage;
-      if (request.boardTab !== "student-board") {
         return;
       }
 
-      const reason = request.reason === "join-init" ? "join" : "resync";
-      sendToStudentChannel(
-        studentId,
-        toTeacherStudentSnapshotMessage(studentId, reason),
-      );
       return;
     }
 
@@ -1369,6 +1365,7 @@ onBeforeUnmount(() => {
                 class="whiteboard-panel"
               >
                 <WhiteboardCanvas
+                  ref="teacherWhiteboardCanvasRef"
                   :snapshot="teacherWhiteboardSnapshot"
                   :background-image="teacherBackgroundImage"
                   @update:snapshot="handleTeacherWhiteboardSnapshot"

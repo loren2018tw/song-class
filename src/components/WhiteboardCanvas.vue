@@ -48,6 +48,13 @@ const currentSize = ref(8);
 const brushSizeValue = ref(currentSize.value);
 const isDrawing = ref(false);
 const activeStroke = ref<WhiteboardStroke | null>(null);
+const drawingLayerDirty = ref(true);
+const cachedFlattenedDrawingLayer = ref<{
+  imageDataUrl: string;
+  width: number;
+  height: number;
+  updatedAt: number;
+} | null>(null);
 let strokeSequence = 0;
 let resizeObserver: ResizeObserver | null = null;
 let backgroundRenderSequence = 0;
@@ -109,6 +116,65 @@ function calculateStageSize() {
 function cloneSnapshot(snapshot: WhiteboardSnapshot): WhiteboardSnapshot {
   return cloneWhiteboardSnapshot(snapshot);
 }
+
+function markDrawingLayerDirty() {
+  drawingLayerDirty.value = true;
+}
+
+function hasStrokesChanged(
+  previousSnapshot: WhiteboardSnapshot,
+  nextSnapshot: WhiteboardSnapshot,
+) {
+  if (previousSnapshot.strokes.length !== nextSnapshot.strokes.length) {
+    return true;
+  }
+
+  for (let index = 0; index < previousSnapshot.strokes.length; index += 1) {
+    const previousStroke = previousSnapshot.strokes[index];
+    const nextStroke = nextSnapshot.strokes[index];
+    if (!nextStroke) {
+      return true;
+    }
+
+    if (
+      previousStroke.id !== nextStroke.id ||
+      previousStroke.tool !== nextStroke.tool ||
+      previousStroke.color !== nextStroke.color ||
+      previousStroke.size !== nextStroke.size ||
+      previousStroke.points.length !== nextStroke.points.length
+    ) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+function getFlattenedDrawingLayer() {
+  const canvasElement = drawingCanvasRef.value;
+  if (!canvasElement) {
+    return null;
+  }
+
+  if (!drawingLayerDirty.value && cachedFlattenedDrawingLayer.value) {
+    return cachedFlattenedDrawingLayer.value;
+  }
+
+  const flattened = {
+    imageDataUrl: canvasElement.toDataURL("image/png"),
+    width: WHITEBOARD_CANVAS_WIDTH,
+    height: WHITEBOARD_CANVAS_HEIGHT,
+    updatedAt: Date.now(),
+  };
+
+  cachedFlattenedDrawingLayer.value = flattened;
+  drawingLayerDirty.value = false;
+  return flattened;
+}
+
+defineExpose({
+  getFlattenedDrawingLayer,
+});
 
 function emitSyncEvent(payload: WhiteboardIncrementalEventPayload) {
   if (isReadOnlyMode.value) {
@@ -298,13 +364,50 @@ function hasBackgroundChanged(
   );
 }
 
+function mergeInProgressStroke(
+  incomingSnapshot: WhiteboardSnapshot,
+): WhiteboardSnapshot {
+  if (isReadOnlyMode.value || !isDrawing.value || !activeStroke.value) {
+    return incomingSnapshot;
+  }
+
+  const mergedSnapshot = cloneSnapshot(incomingSnapshot);
+  const localStroke = cloneWhiteboardStroke(activeStroke.value);
+  const existingIndex = mergedSnapshot.strokes.findIndex(
+    (stroke) => stroke.id === localStroke.id,
+  );
+
+  if (existingIndex === -1) {
+    mergedSnapshot.strokes.push(localStroke);
+  } else {
+    mergedSnapshot.strokes[existingIndex] = localStroke;
+  }
+
+  return mergedSnapshot;
+}
+
 function syncLocalStateFromSnapshot(snapshot: WhiteboardSnapshot) {
   const previousSnapshot = currentSnapshot.value;
-  const cloned = cloneSnapshot(snapshot);
+  const cloned = mergeInProgressStroke(cloneSnapshot(snapshot));
   currentSnapshot.value = {
     ...cloned,
     backgroundImage: cloned.backgroundImage ?? null,
   };
+
+  if (!isReadOnlyMode.value && isDrawing.value && activeStroke.value) {
+    const reboundStroke =
+      currentSnapshot.value.strokes.find(
+        (stroke) => stroke.id === activeStroke.value?.id,
+      ) ?? null;
+
+    if (reboundStroke) {
+      activeStroke.value = reboundStroke;
+    }
+  }
+
+  if (hasStrokesChanged(previousSnapshot, currentSnapshot.value)) {
+    markDrawingLayerDirty();
+  }
 
   if (hasBackgroundChanged(previousSnapshot, currentSnapshot.value)) {
     void redrawBackgroundCanvas();
@@ -359,6 +462,7 @@ function appendPoint(point: WhiteboardPoint) {
   }
 
   stroke.points.push(point);
+  markDrawingLayerDirty();
   emitSyncEvent({
     type: "stroke-point",
     strokeId: stroke.id,
@@ -393,6 +497,7 @@ function beginDrawing(event: PointerEvent) {
   activeStroke.value = createStroke(currentTool.value);
   activeStroke.value.points.push(point);
   currentSnapshot.value.strokes.push(activeStroke.value);
+  markDrawingLayerDirty();
   emitSyncEvent({
     type: "stroke-begin",
     stroke: cloneWhiteboardStroke(activeStroke.value),
@@ -494,14 +599,25 @@ function activateEraser() {
 }
 
 function clearCanvas() {
+  const clearedBackgroundImage = normalizeBackgroundInstruction(
+    props.backgroundImage,
+  );
+
   currentSnapshot.value = {
     ...createEmptyWhiteboardSnapshot(),
-    backgroundImage: currentSnapshot.value.backgroundImage ?? null,
+    backgroundImage: clearedBackgroundImage,
   };
   activeStroke.value = null;
   isDrawing.value = false;
-  redrawDrawingCanvas();
+  markDrawingLayerDirty();
+  redrawAll();
   emitSyncEvent({ type: "clear" });
+  emitSyncEvent({
+    type: "background-change",
+    backgroundImage: currentSnapshot.value.backgroundImage,
+    backgroundColor:
+      currentSnapshot.value.backgroundColor || WHITEBOARD_BACKGROUND_COLOR,
+  });
   emitSnapshot();
 }
 
@@ -513,6 +629,7 @@ watch(
         ...createEmptyWhiteboardSnapshot(),
         backgroundImage: normalizeBackgroundInstruction(props.backgroundImage),
       };
+      markDrawingLayerDirty();
       redrawAll();
       return;
     }

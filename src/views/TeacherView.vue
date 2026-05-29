@@ -71,6 +71,7 @@ const serviceLabel = computed(() => {
 const teacherBrowserUrl = computed(() => {
   if (import.meta.env.DEV) {
     const base = new URL(window.location.origin);
+    base.pathname = "/";
     base.searchParams.set("mode", "teacher");
     base.searchParams.set("base", serverInfo.value.url);
     return base.toString();
@@ -85,8 +86,8 @@ const importantRoutes = computed(() => {
     base,
     teacherRedirect: `${base}/teacher`,
     studentRedirect: `${base}/student`,
-    appTeacher: `${base}/app/?mode=teacher`,
-    appStudent: `${base}/app/?mode=student`,
+    appTeacher: `${base}/teacher`,
+    appStudent: `${base}/student`,
     health: `${base}/health`,
   };
 });

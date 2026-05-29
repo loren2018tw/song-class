@@ -191,6 +191,15 @@ export interface WhiteboardStudentBoardControlMessage {
   backgroundImage?: string | null;
 }
 
+export interface WhiteboardTeacherBoardControlMessage {
+  kind: "teacher-board-control";
+  action: "set-background";
+  modeVersion: number;
+  tabVersion: number;
+  backgroundImage?: string | null;
+  backgroundColor?: string;
+}
+
 export interface WhiteboardStudentViewControlMessage {
   kind: "student-view-control";
   forceTeacherBoardView: boolean;
@@ -210,6 +219,7 @@ export type WhiteboardSyncMessage =
   | WhiteboardTeacherStudentEventBatchMessage
   | WhiteboardTeacherStudentResyncRequestMessage
   | WhiteboardTeacherStudentSnapshotMessage
+  | WhiteboardTeacherBoardControlMessage
   | WhiteboardStudentBoardControlMessage
   | WhiteboardStudentViewControlMessage
   | WhiteboardStudentOpenUrlMessage
@@ -289,6 +299,7 @@ export function isWhiteboardSyncMessage(
     kind === "teacher-student-events-batch" ||
     kind === "teacher-student-resync-request" ||
     kind === "teacher-student-snapshot" ||
+    kind === "teacher-board-control" ||
     kind === "student-board-control" ||
     kind === "student-view-control" ||
     kind === "student-open-url" ||

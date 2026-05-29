@@ -1,6 +1,7 @@
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Query, State};
-use axum::http::header::ACCESS_CONTROL_ALLOW_ORIGIN;
+use axum::http::header::{ACCESS_CONTROL_ALLOW_ORIGIN, HOST};
+use axum::http::HeaderMap;
 use axum::response::{IntoResponse, Redirect};
 use axum::routing::get;
 use axum::{Json, Router};
@@ -182,6 +183,21 @@ async fn student_page() -> impl IntoResponse {
 
 async fn teacher_page() -> impl IntoResponse {
     Redirect::temporary("/app/?mode=teacher")
+}
+
+async fn app_page(
+    headers: HeaderMap,
+    Query(query): Query<HashMap<String, String>>,
+) -> impl IntoResponse {
+    let mode = query.get("mode").map(String::as_str).unwrap_or("student");
+    let host = headers
+        .get(HOST)
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| !value.is_empty())
+        .unwrap_or("127.0.0.1:17860");
+
+    let target = format!("http://127.0.0.1:1420/?mode={mode}&base=http://{host}");
+    Redirect::temporary(&target)
 }
 
 async fn ws_handler(
@@ -529,10 +545,9 @@ async fn start_server_impl(runtime: Arc<Mutex<BackendRuntime>>) -> Result<Server
     };
 
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
-    let app_assets = ServeDir::new(frontend_assets_root.clone())
-        .not_found_service(ServeFile::new(frontend_assets_root.join("index.html")));
+    let frontend_index_exists = frontend_assets_root.join("index.html").is_file();
     let root_assets = ServeDir::new(frontend_assets_root.join("assets"));
-    let router = Router::new()
+    let mut router = Router::new()
         .route("/", get(student_page))
         .route("/student", get(student_page))
         .route("/teacher", get(teacher_page))
@@ -544,8 +559,15 @@ async fn start_server_impl(runtime: Arc<Mutex<BackendRuntime>>) -> Result<Server
         )
         .route("/ws", get(ws_handler))
         .nest_service("/assets", root_assets)
-        .nest_service("/app", app_assets)
         .with_state(HttpState { hub });
+
+    if frontend_index_exists {
+        let app_assets = ServeDir::new(frontend_assets_root.clone())
+            .not_found_service(ServeFile::new(frontend_assets_root.join("index.html")));
+        router = router.nest_service("/app", app_assets);
+    } else {
+        router = router.route("/app", get(app_page));
+    }
 
     let join_handle = tauri::async_runtime::spawn(async move {
         let _ = axum::serve(listener, router)
@@ -634,8 +656,8 @@ async fn get_server_debug_info(
             .collect(),
         executable_path,
         tauri_resource_dir,
-        app_teacher_url: format!("{base_url}/app/?mode=teacher"),
-        app_student_url: format!("{base_url}/app/?mode=student"),
+        app_teacher_url: format!("{base_url}/teacher"),
+        app_student_url: format!("{base_url}/student"),
         teacher_redirect_url: format!("{base_url}/teacher"),
         student_redirect_url: format!("{base_url}/student"),
     })
