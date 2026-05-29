@@ -1,5 +1,6 @@
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Query, State};
+use axum::http::header::ACCESS_CONTROL_ALLOW_ORIGIN;
 use axum::response::{IntoResponse, Redirect};
 use axum::routing::get;
 use axum::{Json, Router};
@@ -16,6 +17,7 @@ use tower_http::services::{ServeDir, ServeFile};
 use uuid::Uuid;
 
 const DEFAULT_PORT: u16 = 17860;
+const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "kebab-case")]
@@ -140,6 +142,13 @@ struct WsQuery {
 
 async fn health() -> impl IntoResponse {
     Json(json!({ "ok": true }))
+}
+
+async fn app_version() -> impl IntoResponse {
+    (
+        [(ACCESS_CONTROL_ALLOW_ORIGIN, "*")],
+        Json(json!({ "version": APP_VERSION })),
+    )
 }
 
 async fn student_page() -> impl IntoResponse {
@@ -498,6 +507,7 @@ async fn start_server_impl(runtime: Arc<Mutex<BackendRuntime>>) -> Result<Server
         .route("/", get(student_page))
         .route("/student", get(student_page))
         .route("/teacher", get(teacher_page))
+        .route("/api/app/version", get(app_version))
         .route("/health", get(health))
         .route_service("/vite.svg", ServeFile::new("../dist/vite.svg"))
         .route("/ws", get(ws_handler))
@@ -566,6 +576,11 @@ async fn get_server_info(state: tauri::State<'_, BackendState>) -> Result<Server
     Ok(guard.control.to_info())
 }
 
+#[tauri::command]
+fn get_app_version() -> String {
+    APP_VERSION.to_string()
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -581,7 +596,8 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             start_server,
             stop_server,
-            get_server_info
+            get_server_info,
+            get_app_version
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

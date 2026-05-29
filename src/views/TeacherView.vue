@@ -4,6 +4,7 @@ import { openUrl } from "@tauri-apps/plugin-opener";
 import { computed, onBeforeUnmount, onMounted, ref } from "vue";
 import ConnectionInfoCard from "../components/ConnectionInfoCard.vue";
 import StudentListCard from "../components/StudentListCard.vue";
+import { useAppVersion } from "../composables/useAppVersion";
 import type {
   ServerInfo,
   SignalEnvelope,
@@ -21,6 +22,8 @@ const wsStatus = ref("尚未連線");
 const actionError = ref("");
 
 let ws: WebSocket | null = null;
+
+const { appVersionLabel } = useAppVersion();
 
 const wsUrl = computed(() => {
   const base = new URL(serverInfo.value.url);
@@ -143,16 +146,21 @@ onBeforeUnmount(() => {
             {{ actionError }}
           </p>
         </div>
-        <div class="d-flex ga-2">
-          <v-btn color="primary" @click="openTeacherInBrowser"
-            >開啟教師端</v-btn
-          >
-          <v-btn color="secondary" variant="outlined" @click="stopServer"
-            >停止服務</v-btn
-          >
-          <v-btn color="primary" variant="outlined" @click="restartServer"
-            >重新啟動</v-btn
-          >
+        <div class="d-flex flex-column align-end ga-2">
+          <p class="text-caption text-medium-emphasis mb-0">
+            {{ appVersionLabel }}
+          </p>
+          <div class="d-flex ga-2">
+            <v-btn color="primary" @click="openTeacherInBrowser"
+              >開啟教師端</v-btn
+            >
+            <v-btn color="secondary" variant="outlined" @click="stopServer"
+              >停止服務</v-btn
+            >
+            <v-btn color="primary" variant="outlined" @click="restartServer"
+              >重新啟動</v-btn
+            >
+          </div>
         </div>
       </v-col>
     </v-row>

@@ -2,6 +2,7 @@
 import { computed, onBeforeUnmount, ref } from "vue";
 import NicknameJoinCard from "../components/NicknameJoinCard.vue";
 import WhiteboardCanvas from "../components/WhiteboardCanvas.vue";
+import { useAppVersion } from "../composables/useAppVersion";
 import { createPeerConnection } from "../composables/usePeerConnection";
 import type { SignalEnvelope } from "../types/session";
 import {
@@ -26,6 +27,8 @@ import {
 const props = defineProps<{
   baseUrl: string;
 }>();
+
+const { appVersionLabel } = useAppVersion(props.baseUrl);
 
 const STUDENT_BATCH_INTERVAL_MS = 33;
 const STUDENT_BATCH_MAX_EVENTS = 24;
@@ -673,79 +676,106 @@ onBeforeUnmount(() => {
 </script>
 
 <template>
-  <v-container v-if="!isConnected || activeMode !== 'whiteboard'" class="py-8">
-    <v-row justify="center">
-      <v-col cols="12" md="8" lg="7">
-        <NicknameJoinCard v-if="!isConnected" @submit="handleJoin" />
-
-        <v-card
-          v-else
-          rounded="xl"
-          elevation="8"
-          class="d-flex align-center justify-center py-16"
-        >
-          <v-card-text class="text-center">
-            <div class="text-h4 font-weight-black mb-2">請專心學習</div>
-            <div class="text-medium-emphasis">等待教師切換課堂功能</div>
-          </v-card-text>
-        </v-card>
-
-        <v-alert class="mt-4" type="info" variant="tonal">{{
-          statusText
-        }}</v-alert>
-        <v-alert v-if="signalError" class="mt-3" type="error" variant="tonal">{{
-          signalError
-        }}</v-alert>
-      </v-col>
-    </v-row>
-  </v-container>
-
-  <div v-else class="student-whiteboard-screen">
-    <v-tabs
-      color="primary"
-      density="compact"
-      :disabled="isTeacherBoardViewForced"
-      :model-value="activeTab"
-      @update:model-value="onStudentTabChanged"
+  <div class="student-view-root">
+    <div class="app-version-chip">{{ appVersionLabel }}</div>
+    <v-container
+      v-if="!isConnected || activeMode !== 'whiteboard'"
+      class="py-8"
     >
-      <v-tab value="teacher-board">
-        <v-icon icon="mdi-account" start />
-        教師白板
-      </v-tab>
-      <v-tab value="student-board">
-        <v-icon icon="mdi-account-multiple" start />
-        學生白板
-      </v-tab>
-    </v-tabs>
+      <v-row justify="center">
+        <v-col cols="12" md="8" lg="7">
+          <NicknameJoinCard v-if="!isConnected" @submit="handleJoin" />
 
-    <div
-      v-show="activeTab === 'teacher-board'"
-      class="student-whiteboard-canvas-wrap"
-    >
-      <WhiteboardCanvas
-        title="教師白板"
-        :snapshot="teacherSnapshot"
-        :show-toolbar="false"
-        class="student-whiteboard-canvas"
-      />
-    </div>
+          <v-card
+            v-else
+            rounded="xl"
+            elevation="8"
+            class="d-flex align-center justify-center py-16"
+          >
+            <v-card-text class="text-center">
+              <div class="text-h4 font-weight-black mb-2">請專心學習</div>
+              <div class="text-medium-emphasis">等待教師切換課堂功能</div>
+            </v-card-text>
+          </v-card>
 
-    <div
-      v-show="activeTab === 'student-board'"
-      class="student-whiteboard-canvas-wrap"
-    >
-      <WhiteboardCanvas
-        title="學生白板"
-        :snapshot="studentSnapshot"
-        class="student-whiteboard-canvas"
-        @update:snapshot="handleStudentSnapshot"
-        @sync-event="handleStudentSyncEvent"
-      />
+          <v-alert class="mt-4" type="info" variant="tonal">{{
+            statusText
+          }}</v-alert>
+          <v-alert
+            v-if="signalError"
+            class="mt-3"
+            type="error"
+            variant="tonal"
+            >{{ signalError }}</v-alert
+          >
+        </v-col>
+      </v-row>
+    </v-container>
+
+    <div v-else class="student-whiteboard-screen">
+      <v-tabs
+        color="primary"
+        density="compact"
+        :disabled="isTeacherBoardViewForced"
+        :model-value="activeTab"
+        @update:model-value="onStudentTabChanged"
+      >
+        <v-tab value="teacher-board">
+          <v-icon icon="mdi-account" start />
+          教師白板
+        </v-tab>
+        <v-tab value="student-board">
+          <v-icon icon="mdi-account-multiple" start />
+          學生白板
+        </v-tab>
+      </v-tabs>
+
+      <div
+        v-show="activeTab === 'teacher-board'"
+        class="student-whiteboard-canvas-wrap"
+      >
+        <WhiteboardCanvas
+          title="教師白板"
+          :snapshot="teacherSnapshot"
+          :show-toolbar="false"
+          class="student-whiteboard-canvas"
+        />
+      </div>
+
+      <div
+        v-show="activeTab === 'student-board'"
+        class="student-whiteboard-canvas-wrap"
+      >
+        <WhiteboardCanvas
+          title="學生白板"
+          :snapshot="studentSnapshot"
+          class="student-whiteboard-canvas"
+          @update:snapshot="handleStudentSnapshot"
+          @sync-event="handleStudentSyncEvent"
+        />
+      </div>
     </div>
   </div>
 </template>
 
 <style scoped>
+.student-view-root {
+  position: relative;
+}
+
+.app-version-chip {
+  position: fixed;
+  top: 10px;
+  right: 14px;
+  z-index: 30;
+  padding: 2px 8px;
+  border-radius: 999px;
+  font-size: 0.75rem;
+  color: rgba(var(--v-theme-on-surface), 0.72);
+  background: rgba(255, 255, 255, 0.72);
+  pointer-events: none;
+}
+
 .student-whiteboard-screen {
   height: 100dvh;
   max-height: 100dvh;

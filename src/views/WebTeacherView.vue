@@ -10,6 +10,7 @@ import {
 } from "vue";
 import WhiteboardCanvas from "../components/WhiteboardCanvas.vue";
 import StudentListCard from "../components/StudentListCard.vue";
+import { useAppVersion } from "../composables/useAppVersion";
 import { createPeerConnection } from "../composables/usePeerConnection";
 import type { SignalEnvelope, StudentSession } from "../types/session";
 import {
@@ -38,6 +39,8 @@ import {
 const props = defineProps<{
   baseUrl: string;
 }>();
+
+const { appVersionLabel } = useAppVersion(props.baseUrl);
 
 const students = ref<StudentSession[]>([]);
 const wsStatus = ref("尚未連線");
@@ -1100,8 +1103,12 @@ onBeforeUnmount(() => {
 
 <template>
   <v-app>
-    <v-app-bar title="song-class(教師端)"></v-app-bar>
-    <v-navigation-drawer :width="200">
+    <v-app-bar title="song-class(教師端)">
+      <template #append>
+        <span class="app-version-text">{{ appVersionLabel }}</span>
+      </template>
+    </v-app-bar>
+    <v-navigation-drawer :width="200" permanent>
       <div>
         <p class="text-medium-emphasis mb-0">WebSocket: {{ wsStatus }}</p>
       </div>
@@ -1335,6 +1342,12 @@ onBeforeUnmount(() => {
 </template>
 
 <style scoped>
+.app-version-text {
+  font-size: 0.75rem;
+  color: rgba(var(--v-theme-on-surface), 0.72);
+  white-space: nowrap;
+}
+
 .teacher-main {
   height: calc(100vh - 64px);
   overflow: hidden;
