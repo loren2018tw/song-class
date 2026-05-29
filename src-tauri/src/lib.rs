@@ -9,6 +9,7 @@ use local_ip_address::local_ip;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 use tauri::Manager;
 use tokio::net::TcpListener;
@@ -100,6 +101,9 @@ struct HttpState {
 struct BackendRuntime {
     control: ServerControl,
     hub: Arc<Mutex<SessionHub>>,
+    frontend_assets_root: PathBuf,
+    frontend_assets_candidates: Vec<PathBuf>,
+    tauri_resource_dir: Option<String>,
     running: Option<ServerHandle>,
 }
 
@@ -109,15 +113,36 @@ struct BackendState {
 }
 
 impl BackendState {
-    fn new() -> Self {
+    fn new(
+        frontend_assets_root: PathBuf,
+        frontend_assets_candidates: Vec<PathBuf>,
+        tauri_resource_dir: Option<String>,
+    ) -> Self {
         Self {
             inner: Arc::new(Mutex::new(BackendRuntime {
                 control: ServerControl::new(DEFAULT_PORT),
                 hub: Arc::new(Mutex::new(SessionHub::default())),
+                frontend_assets_root,
+                frontend_assets_candidates,
+                tauri_resource_dir,
                 running: None,
             })),
         }
     }
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ServerDebugInfo {
+    frontend_assets_root: String,
+    frontend_index_exists: bool,
+    frontend_assets_dir_exists: bool,
+    checked_frontend_paths: Vec<String>,
+    executable_path: Option<String>,
+    tauri_resource_dir: Option<String>,
+    app_teacher_url: String,
+    app_student_url: String,
+    teacher_redirect_url: String,
+    student_redirect_url: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -478,7 +503,7 @@ async fn handle_socket(socket: WebSocket, hub: Arc<Mutex<SessionHub>>, role: Str
 }
 
 async fn start_server_impl(runtime: Arc<Mutex<BackendRuntime>>) -> Result<ServerInfo, String> {
-    let (port, hub) = {
+    let (port, hub, frontend_assets_root) = {
         let mut guard = runtime.lock().await;
         if guard.running.is_some() {
             return Ok(guard.control.to_info());
@@ -486,7 +511,11 @@ async fn start_server_impl(runtime: Arc<Mutex<BackendRuntime>>) -> Result<Server
         guard.control.status = ServiceStatus::Starting;
         guard.control.error = None;
         guard.control.refresh_ip_url();
-        (guard.control.port, guard.hub.clone())
+        (
+            guard.control.port,
+            guard.hub.clone(),
+            guard.frontend_assets_root.clone(),
+        )
     };
 
     let listener = match TcpListener::bind(("0.0.0.0", port)).await {
@@ -500,16 +529,19 @@ async fn start_server_impl(runtime: Arc<Mutex<BackendRuntime>>) -> Result<Server
     };
 
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
-    let app_assets =
-        ServeDir::new("../dist").not_found_service(ServeFile::new("../dist/index.html"));
-    let root_assets = ServeDir::new("../dist/assets");
+    let app_assets = ServeDir::new(frontend_assets_root.clone())
+        .not_found_service(ServeFile::new(frontend_assets_root.join("index.html")));
+    let root_assets = ServeDir::new(frontend_assets_root.join("assets"));
     let router = Router::new()
         .route("/", get(student_page))
         .route("/student", get(student_page))
         .route("/teacher", get(teacher_page))
         .route("/api/app/version", get(app_version))
         .route("/health", get(health))
-        .route_service("/vite.svg", ServeFile::new("../dist/vite.svg"))
+        .route_service(
+            "/vite.svg",
+            ServeFile::new(frontend_assets_root.join("vite.svg")),
+        )
         .route("/ws", get(ws_handler))
         .nest_service("/assets", root_assets)
         .nest_service("/app", app_assets)
@@ -577,16 +609,107 @@ async fn get_server_info(state: tauri::State<'_, BackendState>) -> Result<Server
 }
 
 #[tauri::command]
+async fn get_server_debug_info(
+    state: tauri::State<'_, BackendState>,
+) -> Result<ServerDebugInfo, String> {
+    let mut guard = state.inner.lock().await;
+    guard.control.refresh_ip_url();
+
+    let base_url = guard.control.url.clone();
+    let frontend_assets_root = guard.frontend_assets_root.clone();
+    let frontend_assets_candidates = guard.frontend_assets_candidates.clone();
+    let tauri_resource_dir = guard.tauri_resource_dir.clone();
+    let frontend_assets_root_text = frontend_assets_root.to_string_lossy().to_string();
+    let executable_path = std::env::current_exe()
+        .ok()
+        .map(|path| path.to_string_lossy().to_string());
+
+    Ok(ServerDebugInfo {
+        frontend_assets_root: frontend_assets_root_text,
+        frontend_index_exists: frontend_assets_root.join("index.html").is_file(),
+        frontend_assets_dir_exists: frontend_assets_root.join("assets").is_dir(),
+        checked_frontend_paths: frontend_assets_candidates
+            .iter()
+            .map(|path| path.to_string_lossy().to_string())
+            .collect(),
+        executable_path,
+        tauri_resource_dir,
+        app_teacher_url: format!("{base_url}/app/?mode=teacher"),
+        app_student_url: format!("{base_url}/app/?mode=student"),
+        teacher_redirect_url: format!("{base_url}/teacher"),
+        student_redirect_url: format!("{base_url}/student"),
+    })
+}
+
+#[tauri::command]
 fn get_app_version() -> String {
     APP_VERSION.to_string()
+}
+
+fn collect_frontend_assets_candidates(app: &tauri::AppHandle) -> Vec<PathBuf> {
+    let mut candidates: Vec<PathBuf> = Vec::new();
+
+    if let Ok(manifest_dir) = std::env::var("CARGO_MANIFEST_DIR") {
+        candidates.push(PathBuf::from(manifest_dir).join("../dist"));
+    }
+
+    if let Ok(current_dir) = std::env::current_dir() {
+        candidates.push(current_dir.join("dist"));
+        candidates.push(current_dir.join("../dist"));
+    }
+
+    if let Ok(resource_dir) = app.path().resource_dir() {
+        candidates.push(resource_dir.join("dist"));
+        candidates.push(resource_dir.join("_up_/dist"));
+        candidates.push(resource_dir);
+    }
+
+    if let Ok(executable_path) = std::env::current_exe() {
+        if let Some(executable_dir) = executable_path.parent() {
+            // Linux deb/rpm install usually places binary in /usr/bin and app assets in /usr/lib/<app>/_up_/dist.
+            candidates.push(executable_dir.join("../lib/song-class/_up_/dist"));
+            candidates.push(executable_dir.join("../lib/song-class/dist"));
+            candidates.push(executable_dir.join("_up_/dist"));
+            candidates.push(executable_dir.join("dist"));
+        }
+    }
+
+    candidates.push(PathBuf::from("/usr/lib/song-class/_up_/dist"));
+
+    candidates
+}
+
+fn resolve_frontend_assets_root(candidates: &[PathBuf]) -> PathBuf {
+    for candidate in candidates {
+        if candidate.join("index.html").is_file() {
+            return candidate.clone();
+        }
+    }
+
+    if let Some(first_candidate) = candidates.first() {
+        return first_candidate.clone();
+    }
+
+    PathBuf::from("../dist")
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
-        .manage(BackendState::new())
         .setup(|app| {
+            let tauri_resource_dir = app
+                .path()
+                .resource_dir()
+                .ok()
+                .map(|path| path.to_string_lossy().to_string());
+            let frontend_assets_candidates = collect_frontend_assets_candidates(app.handle());
+            let frontend_assets_root = resolve_frontend_assets_root(&frontend_assets_candidates);
+            app.manage(BackendState::new(
+                frontend_assets_root,
+                frontend_assets_candidates,
+                tauri_resource_dir,
+            ));
             let runtime = app.state::<BackendState>().inner.clone();
             tauri::async_runtime::spawn(async move {
                 let _ = start_server_impl(runtime).await;
@@ -597,6 +720,7 @@ pub fn run() {
             start_server,
             stop_server,
             get_server_info,
+            get_server_debug_info,
             get_app_version
         ])
         .run(tauri::generate_context!())
