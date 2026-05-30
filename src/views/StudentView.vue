@@ -35,6 +35,12 @@ const { appVersionLabel } = useAppVersion(props.baseUrl);
 const STUDENT_BATCH_INTERVAL_MS = 33;
 const STUDENT_BATCH_MAX_EVENTS = 24;
 const LAST_STUDENT_NICKNAME_STORAGE_KEY = "song-class:last-student-nickname";
+const LAST_STUDENT_NICKNAME_TTL_MS = 12 * 60 * 60 * 1000;
+
+type PersistedStudentNickname = {
+  nickname: string;
+  savedAt: number;
+};
 
 const statusText = ref("尚未連線");
 const isConnected = ref(false);
@@ -119,9 +125,58 @@ function optionBadgeColor(option: QuickQaOption): string {
   }
 }
 
+function isPersistedNicknameExpired(savedAt: number): boolean {
+  return Date.now() - savedAt > LAST_STUDENT_NICKNAME_TTL_MS;
+}
+
+function parsePersistedStudentNickname(
+  raw: string,
+): PersistedStudentNickname | null {
+  try {
+    const parsed = JSON.parse(raw) as Partial<PersistedStudentNickname>;
+    if (
+      typeof parsed.nickname !== "string" ||
+      typeof parsed.savedAt !== "number" ||
+      !Number.isFinite(parsed.savedAt)
+    ) {
+      return null;
+    }
+
+    return {
+      nickname: parsed.nickname,
+      savedAt: parsed.savedAt,
+    };
+  } catch {
+    return null;
+  }
+}
+
 function readLastStudentNickname(): string {
   try {
-    return localStorage.getItem(LAST_STUDENT_NICKNAME_STORAGE_KEY) ?? "";
+    const stored = localStorage.getItem(LAST_STUDENT_NICKNAME_STORAGE_KEY);
+    if (!stored) {
+      return "";
+    }
+
+    const parsed = parsePersistedStudentNickname(stored);
+    if (parsed) {
+      if (isPersistedNicknameExpired(parsed.savedAt)) {
+        localStorage.removeItem(LAST_STUDENT_NICKNAME_STORAGE_KEY);
+        return "";
+      }
+
+      return parsed.nickname;
+    }
+
+    // Backward compatibility: migrate legacy plain-string format.
+    const legacyNickname = stored.trim();
+    if (!legacyNickname) {
+      localStorage.removeItem(LAST_STUDENT_NICKNAME_STORAGE_KEY);
+      return "";
+    }
+
+    saveLastStudentNickname(legacyNickname);
+    return legacyNickname;
   } catch {
     return "";
   }
@@ -129,7 +184,14 @@ function readLastStudentNickname(): string {
 
 function saveLastStudentNickname(nickname: string) {
   try {
-    localStorage.setItem(LAST_STUDENT_NICKNAME_STORAGE_KEY, nickname);
+    const payload: PersistedStudentNickname = {
+      nickname,
+      savedAt: Date.now(),
+    };
+    localStorage.setItem(
+      LAST_STUDENT_NICKNAME_STORAGE_KEY,
+      JSON.stringify(payload),
+    );
   } catch {
     // Ignore storage failures and continue with in-memory value.
   }
@@ -754,7 +816,12 @@ function attemptResumeReconnect(reason: string) {
     return;
   }
 
-  const nickname = lastJoinedNickname.value.trim();
+  const persistedNickname = readLastStudentNickname();
+  if (persistedNickname !== lastJoinedNickname.value) {
+    lastJoinedNickname.value = persistedNickname;
+  }
+
+  const nickname = persistedNickname.trim();
   if (!nickname) {
     return;
   }

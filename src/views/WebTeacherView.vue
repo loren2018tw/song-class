@@ -16,6 +16,8 @@ import { createPeerConnection } from "../composables/usePeerConnection";
 import type { SignalEnvelope, StudentSession } from "../types/session";
 import {
   QUICK_QA_OPTIONS,
+  WHITEBOARD_CANVAS_HEIGHT,
+  WHITEBOARD_CANVAS_WIDTH,
   cloneWhiteboardSnapshot,
   cloneWhiteboardStroke,
   createEmptyQuickQaOptions,
@@ -52,6 +54,11 @@ const students = ref<StudentSession[]>([]);
 const wsStatus = ref("尚未連線");
 const rtcError = ref("");
 const rtcErrorVisible = ref(false);
+const countdownMinutesInput = ref(0);
+const countdownSecondsInput = ref(0);
+const countdownRemainingSeconds = ref(0);
+const countdownRunning = ref(false);
+const countdownDoneSnackbarVisible = ref(false);
 const studentQrDialogVisible = ref(false);
 const openUrlDialogVisible = ref(false);
 const studentOpenUrlInput = ref("");
@@ -67,18 +74,8 @@ const quickQaOptionInputs = reactive<Record<QuickQaOption, string>>(
 );
 const quickQaQuestion = ref<QuickQaQuestion | null>(null);
 const quickQaResultView = ref<"summary" | "details">("summary");
-const quickQaCorrectOptionChoice = ref<QuickQaOption | "none">("none");
+const quickQaCloseDialogVisible = ref(false);
 const quickQaStageCorrectCounts = reactive(new Map<string, number>());
-const quickQaCorrectOptionItems: Array<{
-  title: string;
-  value: QuickQaOption | "none";
-}> = [
-  { title: "不設定正確答案", value: "none" },
-  ...QUICK_QA_OPTIONS.map((option) => ({
-    title: `答案 ${option}`,
-    value: option,
-  })),
-];
 const knownStudentNames = reactive(new Map<string, string>());
 
 const whiteboardBackgroundOptions = [
@@ -91,6 +88,7 @@ const whiteboardBackgroundOptions = [
 
 const teacherBackground = ref<string | null>(null);
 const studentBackground = ref<string | null>(null);
+const downloadingStudentBoardsPdf = ref(false);
 
 type WhiteboardCanvasExposed = {
   getFlattenedDrawingLayer: () => {
@@ -127,6 +125,8 @@ let nextTeacherSequence = 1;
 let teacherBatchFlushTimer: number | null = null;
 
 let ws: WebSocket | null = null;
+let countdownTimerId: number | null = null;
+let countdownAudioContext: AudioContext | null = null;
 
 const BATCH_INTERVAL_MS = 33;
 const BATCH_MAX_EVENTS = 24;
@@ -142,6 +142,17 @@ const studentJoinUrl = computed(() => {
   const studentUrl = new URL("/", props.baseUrl);
   return studentUrl.toString();
 });
+const countdownPauseResumeIcon = computed(() =>
+  countdownRunning.value ? "mdi-pause" : "mdi-play",
+);
+const countdownPauseResumeTooltip = computed(() =>
+  countdownRunning.value
+    ? "暫停"
+    : countdownRemainingSeconds.value > 0
+      ? "繼續"
+      : "開始",
+);
+const countdownMinutePresets = [1, 5, 10, 15] as const;
 
 async function openStudentQrDialogAndCopyUrl() {
   studentQrDialogVisible.value = true;
@@ -302,6 +313,176 @@ function showRtcError(message: string) {
   rtcErrorVisible.value = true;
 }
 
+function clampCountdownInputs() {
+  countdownMinutesInput.value = Math.max(
+    0,
+    Math.min(99, Math.floor(Number(countdownMinutesInput.value) || 0)),
+  );
+  countdownSecondsInput.value = Math.max(
+    0,
+    Math.min(59, Math.floor(Number(countdownSecondsInput.value) || 0)),
+  );
+}
+
+function getConfiguredCountdownSeconds() {
+  clampCountdownInputs();
+  return countdownMinutesInput.value * 60 + countdownSecondsInput.value;
+}
+
+function stopCountdownTimer() {
+  if (countdownTimerId !== null) {
+    window.clearInterval(countdownTimerId);
+    countdownTimerId = null;
+  }
+  countdownRunning.value = false;
+}
+
+async function getCountdownAudioContext() {
+  if (!countdownAudioContext) {
+    const audioWindow = window as Window & {
+      webkitAudioContext?: typeof AudioContext;
+    };
+    const Ctx = window.AudioContext ?? audioWindow.webkitAudioContext;
+    if (!Ctx) {
+      return null;
+    }
+    countdownAudioContext = new Ctx();
+  }
+
+  if (countdownAudioContext.state === "suspended") {
+    await countdownAudioContext.resume();
+  }
+
+  return countdownAudioContext;
+}
+
+async function playBeep(frequency = 880, durationMs = 140, volume = 0.06) {
+  const ctx = await getCountdownAudioContext();
+  if (!ctx) {
+    return;
+  }
+
+  const oscillator = ctx.createOscillator();
+  const gainNode = ctx.createGain();
+
+  oscillator.type = "sine";
+  oscillator.frequency.value = frequency;
+  gainNode.gain.value = volume;
+
+  oscillator.connect(gainNode);
+  gainNode.connect(ctx.destination);
+
+  const now = ctx.currentTime;
+  oscillator.start(now);
+  oscillator.stop(now + durationMs / 1000);
+}
+
+function sleepMs(ms: number) {
+  return new Promise((resolve) => {
+    window.setTimeout(resolve, ms);
+  });
+}
+
+async function playCountdownWarningTone() {
+  await playBeep(900, 120, 0.05);
+}
+
+async function playCountdownFinishedTone() {
+  await playBeep(980, 130, 0.07);
+  await sleepMs(120);
+  await playBeep(780, 130, 0.07);
+  await sleepMs(120);
+  await playBeep(1080, 220, 0.08);
+}
+
+function syncCountdownRemainingFromInputIfIdle() {
+  if (countdownRunning.value) {
+    return;
+  }
+  countdownRemainingSeconds.value = getConfiguredCountdownSeconds();
+}
+
+function setCountdownInputsFromRemainingSeconds(totalSeconds: number) {
+  const safeTotal = Math.max(0, Math.floor(totalSeconds));
+  countdownMinutesInput.value = Math.floor(safeTotal / 60);
+  countdownSecondsInput.value = safeTotal % 60;
+}
+
+function startCountdownInterval() {
+  if (countdownTimerId !== null || countdownRemainingSeconds.value <= 0) {
+    return;
+  }
+
+  countdownRunning.value = true;
+  countdownTimerId = window.setInterval(() => {
+    if (countdownRemainingSeconds.value <= 0) {
+      return;
+    }
+
+    countdownRemainingSeconds.value -= 1;
+    setCountdownInputsFromRemainingSeconds(countdownRemainingSeconds.value);
+
+    if (
+      countdownRemainingSeconds.value > 0 &&
+      countdownRemainingSeconds.value <= 5
+    ) {
+      void playCountdownWarningTone();
+    }
+
+    if (countdownRemainingSeconds.value === 0) {
+      stopCountdownTimer();
+      countdownDoneSnackbarVisible.value = true;
+      void playCountdownFinishedTone();
+    }
+  }, 1000);
+}
+
+function startCountdown() {
+  const totalSeconds = getConfiguredCountdownSeconds();
+  if (totalSeconds <= 0) {
+    showRtcError("請先設定倒數時間（至少 1 秒）");
+    return;
+  }
+
+  stopCountdownTimer();
+  countdownRemainingSeconds.value = totalSeconds;
+  setCountdownInputsFromRemainingSeconds(totalSeconds);
+  countdownDoneSnackbarVisible.value = false;
+  startCountdownInterval();
+}
+
+function handlePrimaryCountdownAction() {
+  if (countdownRunning.value) {
+    stopCountdownTimer();
+    return;
+  }
+
+  if (countdownRemainingSeconds.value > 0) {
+    countdownDoneSnackbarVisible.value = false;
+    startCountdownInterval();
+    return;
+  }
+
+  startCountdown();
+}
+
+function endCountdown() {
+  stopCountdownTimer();
+  countdownDoneSnackbarVisible.value = false;
+  countdownRemainingSeconds.value = 0;
+  setCountdownInputsFromRemainingSeconds(0);
+}
+
+function applyCountdownMinutePreset(minutes: number) {
+  if (countdownRunning.value) {
+    return;
+  }
+
+  countdownMinutesInput.value = Math.max(0, Math.floor(minutes));
+  countdownSecondsInput.value = 0;
+  syncCountdownRemainingFromInputIfIdle();
+}
+
 function toModeMessage(): WhiteboardModeSyncMessage {
   return {
     kind: "mode-sync",
@@ -416,7 +597,6 @@ function publishQuickQaQuestion() {
     answersByStudent: {},
   };
 
-  quickQaCorrectOptionChoice.value = "none";
   quickQaResultView.value = "summary";
   applyFeatureMode("quick-qa");
   broadcastToLessonChannels(toQuickQaStateMessage("publish"));
@@ -437,16 +617,28 @@ function resetQuickQaStageLeaderboard() {
   quickQaStageCorrectCounts.clear();
 }
 
-function closeQuickQaQuestion() {
+function openCloseQuickQaDialog() {
   if (!quickQaQuestion.value || quickQaQuestion.value.status === "closed") {
     return;
   }
 
+  quickQaCloseDialogVisible.value = true;
+}
+
+function closeQuickQaCloseDialog() {
+  quickQaCloseDialogVisible.value = false;
+}
+
+function closeQuickQaQuestion(correctOptionChoice: QuickQaOption | "none") {
+  if (!quickQaQuestion.value || quickQaQuestion.value.status === "closed") {
+    return;
+  }
+
+  quickQaCloseDialogVisible.value = false;
+
   const closedAt = Date.now();
   const correctOption =
-    quickQaCorrectOptionChoice.value === "none"
-      ? null
-      : quickQaCorrectOptionChoice.value;
+    correctOptionChoice === "none" ? null : correctOptionChoice;
   const finalAnswers = { ...quickQaQuestion.value.answersByStudent };
 
   if (correctOption) {
@@ -535,6 +727,233 @@ function normalizeValidUrl(urlInput: string): string | null {
     return parsed.toString();
   } catch {
     return null;
+  }
+}
+
+function normalizeBackgroundInstruction(imagePath: string | null | undefined) {
+  if (!imagePath) {
+    return null;
+  }
+
+  const trimmed = imagePath.trim();
+  if (!trimmed) {
+    return null;
+  }
+
+  return trimmed;
+}
+
+function resolveBackgroundImageSource(imagePath: string | null | undefined) {
+  const normalized = normalizeBackgroundInstruction(imagePath);
+  if (!normalized) {
+    return null;
+  }
+
+  const isAbsoluteSource =
+    normalized.startsWith("http://") ||
+    normalized.startsWith("https://") ||
+    normalized.startsWith("data:") ||
+    normalized.startsWith("blob:") ||
+    normalized.startsWith("/");
+
+  if (isAbsoluteSource) {
+    return normalized;
+  }
+
+  return new URL(`../assets/bg/${normalized}`, import.meta.url).href;
+}
+
+function loadImage(src: string) {
+  return new Promise<HTMLImageElement>((resolve, reject) => {
+    const image = new Image();
+    image.onload = () => {
+      resolve(image);
+    };
+    image.onerror = () => {
+      reject(new Error(`背景圖片載入失敗: ${src}`));
+    };
+    image.src = src;
+  });
+}
+
+function drawStroke(
+  context: CanvasRenderingContext2D,
+  stroke: WhiteboardSnapshot["strokes"][number],
+) {
+  if (stroke.points.length === 0) {
+    return;
+  }
+
+  context.save();
+  context.globalCompositeOperation =
+    stroke.tool === "eraser" ? "destination-out" : "source-over";
+  context.strokeStyle = stroke.color;
+  context.fillStyle = stroke.color;
+  context.lineWidth = stroke.size;
+  context.lineCap = "round";
+  context.lineJoin = "round";
+
+  if (stroke.points.length === 1) {
+    const point = stroke.points[0];
+    context.beginPath();
+    context.arc(point.x, point.y, stroke.size / 2, 0, Math.PI * 2);
+    context.fill();
+    context.restore();
+    return;
+  }
+
+  context.beginPath();
+  context.moveTo(stroke.points[0].x, stroke.points[0].y);
+  for (let index = 1; index < stroke.points.length; index += 1) {
+    const point = stroke.points[index];
+    context.lineTo(point.x, point.y);
+  }
+  context.stroke();
+  context.restore();
+}
+
+async function renderSnapshotAsPngDataUrl(snapshot: WhiteboardSnapshot) {
+  const width = Math.max(
+    1,
+    Math.floor(snapshot.canvasWidth || WHITEBOARD_CANVAS_WIDTH),
+  );
+  const height = Math.max(
+    1,
+    Math.floor(snapshot.canvasHeight || WHITEBOARD_CANVAS_HEIGHT),
+  );
+
+  const canvas = document.createElement("canvas");
+  canvas.width = width;
+  canvas.height = height;
+
+  const context = canvas.getContext("2d");
+  if (!context) {
+    throw new Error("無法建立白板匯出畫布");
+  }
+
+  context.clearRect(0, 0, width, height);
+  context.fillStyle = snapshot.backgroundColor || "#ffffff";
+  context.fillRect(0, 0, width, height);
+
+  const backgroundSource = resolveBackgroundImageSource(
+    snapshot.backgroundImage,
+  );
+  if (backgroundSource) {
+    try {
+      const image = await loadImage(backgroundSource);
+      context.drawImage(image, 0, 0, width, height);
+    } catch (error) {
+      console.warn(String(error));
+    }
+  }
+
+  for (const stroke of snapshot.strokes) {
+    drawStroke(context, stroke);
+  }
+
+  return {
+    dataUrl: canvas.toDataURL("image/png"),
+    width,
+    height,
+  };
+}
+
+function toFileTimestamp() {
+  const now = new Date();
+  const yyyy = String(now.getFullYear());
+  const mm = String(now.getMonth() + 1).padStart(2, "0");
+  const dd = String(now.getDate()).padStart(2, "0");
+  const hh = String(now.getHours()).padStart(2, "0");
+  const min = String(now.getMinutes()).padStart(2, "0");
+  const sec = String(now.getSeconds()).padStart(2, "0");
+  return `${yyyy}${mm}${dd}-${hh}${min}${sec}`;
+}
+
+async function downloadStudentBoardsPdf() {
+  if (downloadingStudentBoardsPdf.value) {
+    return;
+  }
+
+  if (studentBoardTiles.value.length === 0) {
+    showRtcError("目前沒有可下載的學生白板");
+    return;
+  }
+
+  downloadingStudentBoardsPdf.value = true;
+
+  try {
+    const { jsPDF } = await import("jspdf");
+    const pdf = new jsPDF({
+      orientation: "portrait",
+      unit: "mm",
+      format: "a4",
+    });
+
+    const pageWidth = pdf.internal.pageSize.getWidth();
+    const pageHeight = pdf.internal.pageSize.getHeight();
+
+    const margin = 10;
+    const slotGap = 8;
+    const slotWidth = pageWidth - margin * 2;
+    const slotHeight = (pageHeight - margin * 2 - slotGap) / 2;
+    const cardPadding = 2;
+
+    for (let index = 0; index < studentBoardTiles.value.length; index += 1) {
+      if (index > 0 && index % 2 === 0) {
+        pdf.addPage("a4", "portrait");
+      }
+
+      const tile = studentBoardTiles.value[index];
+      const slotIndex = index % 2;
+      const slotX = margin;
+      const slotY = margin + slotIndex * (slotHeight + slotGap);
+
+      pdf.setDrawColor(160, 160, 160);
+      pdf.setLineWidth(0.3);
+      pdf.rect(slotX, slotY, slotWidth, slotHeight);
+
+      pdf.setFontSize(12);
+      pdf.text(
+        `${index + 1}. ${tile.nickname}`,
+        slotX + cardPadding,
+        slotY + 5,
+      );
+
+      const rendered = await renderSnapshotAsPngDataUrl(tile.snapshot);
+      const imageAspectRatio = rendered.width / rendered.height;
+      const contentX = slotX + cardPadding;
+      const contentY = slotY + 8;
+      const contentWidth = slotWidth - cardPadding * 2;
+      const contentHeight = slotHeight - 10;
+
+      let imageWidth = contentWidth;
+      let imageHeight = imageWidth / imageAspectRatio;
+
+      if (imageHeight > contentHeight) {
+        imageHeight = contentHeight;
+        imageWidth = imageHeight * imageAspectRatio;
+      }
+
+      const imageX = contentX + (contentWidth - imageWidth) / 2;
+      const imageY = contentY + (contentHeight - imageHeight) / 2;
+
+      pdf.addImage(
+        rendered.dataUrl,
+        "PNG",
+        imageX,
+        imageY,
+        imageWidth,
+        imageHeight,
+        undefined,
+        "FAST",
+      );
+    }
+
+    pdf.save(`student-whiteboards-${toFileTimestamp()}.pdf`);
+  } catch (error) {
+    showRtcError(`下載學生白板失敗: ${String(error)}`);
+  } finally {
+    downloadingStudentBoardsPdf.value = false;
   }
 }
 
@@ -1260,6 +1679,10 @@ watch(studentBackground, (nextBackground) => {
   broadcastToLessonChannels(toStudentBoardBackgroundMessage(nextBackground));
 });
 
+watch([countdownMinutesInput, countdownSecondsInput], () => {
+  syncCountdownRemainingFromInputIfIdle();
+});
+
 watch(
   () => [studentBoardTiles.value.length, activeWhiteboardTab.value],
   async () => {
@@ -1285,6 +1708,13 @@ onMounted(() => {
 });
 
 onBeforeUnmount(() => {
+  stopCountdownTimer();
+
+  if (countdownAudioContext) {
+    void countdownAudioContext.close();
+    countdownAudioContext = null;
+  }
+
   if (teacherBatchFlushTimer !== null) {
     window.clearTimeout(teacherBatchFlushTimer);
     teacherBatchFlushTimer = null;
@@ -1377,6 +1807,86 @@ onBeforeUnmount(() => {
           學生開啟網頁
         </v-btn>
       </div>
+      <v-card rounded="lg" variant="outlined" class="countdown-mini-card ma-2">
+        <v-card-text class="pa-2 d-flex flex-column ga-2">
+          <div class="d-flex ga-2 align-start">
+            <div class="countdown-left d-flex flex-column ga-1">
+              <div class="countdown-title text-overline">倒數計時器</div>
+              <div class="d-flex ga-2">
+                <v-text-field
+                  v-model.number="countdownMinutesInput"
+                  class="countdown-input"
+                  label="分"
+                  type="number"
+                  min="0"
+                  max="99"
+                  density="compact"
+                  variant="outlined"
+                  hide-details
+                  :readonly="countdownRunning"
+                />
+                <v-text-field
+                  v-model.number="countdownSecondsInput"
+                  class="countdown-input"
+                  label="秒"
+                  type="number"
+                  min="0"
+                  max="59"
+                  density="compact"
+                  variant="outlined"
+                  hide-details
+                  :readonly="countdownRunning"
+                />
+              </div>
+
+              <div class="countdown-presets-row d-flex ga-2">
+                <v-btn
+                  v-for="preset in countdownMinutePresets"
+                  :key="`countdown-preset-${preset}`"
+                  class="countdown-preset-btn"
+                  size="x-small"
+                  variant="outlined"
+                  color="primary"
+                  :disabled="countdownRunning"
+                  @click="applyCountdownMinutePreset(preset)"
+                >
+                  {{ preset }}
+                </v-btn>
+              </div>
+            </div>
+
+            <div class="countdown-controls d-flex flex-column ga-2">
+              <v-tooltip :text="countdownPauseResumeTooltip" location="top">
+                <template #activator="{ props: tooltipProps }">
+                  <v-btn
+                    v-bind="tooltipProps"
+                    class="countdown-control-btn"
+                    size="x-small"
+                    :icon="countdownPauseResumeIcon"
+                    :color="countdownRunning ? 'warning' : 'primary'"
+                    :variant="countdownRunning ? 'tonal' : 'flat'"
+                    @click="handlePrimaryCountdownAction"
+                  />
+                </template>
+              </v-tooltip>
+
+              <v-tooltip text="停止" location="top">
+                <template #activator="{ props: tooltipProps }">
+                  <v-btn
+                    v-bind="tooltipProps"
+                    class="countdown-control-btn"
+                    size="x-small"
+                    icon="mdi-stop"
+                    color="secondary"
+                    variant="outlined"
+                    @click="endCountdown"
+                  />
+                </template>
+              </v-tooltip>
+            </div>
+          </div>
+        </v-card-text>
+      </v-card>
       <div class="ma-2">
         <StudentListCard
           class="teacher-student-list-card"
@@ -1478,6 +1988,17 @@ onBeforeUnmount(() => {
                 推送教師白板
               </v-btn>
 
+              <v-btn
+                color="success"
+                variant="tonal"
+                block
+                :loading="downloadingStudentBoardsPdf"
+                :disabled="students.length === 0"
+                @click="downloadStudentBoardsPdf"
+              >
+                下載學生白板
+              </v-btn>
+
               <v-select
                 v-model="teacherBackground"
                 label="教師背景"
@@ -1568,22 +2089,10 @@ onBeforeUnmount(() => {
                   variant="outlined"
                   :disabled="!quickQaCanClose"
                   prepend-icon="mdi-stop-circle-outline"
-                  @click="closeQuickQaQuestion"
+                  @click="openCloseQuickQaDialog"
                 >
                   結束作答
                 </v-btn>
-
-                <v-select
-                  v-model="quickQaCorrectOptionChoice"
-                  :items="quickQaCorrectOptionItems"
-                  item-title="title"
-                  item-value="value"
-                  label="正確答案（可不選）"
-                  variant="outlined"
-                  density="comfortable"
-                  hide-details
-                  class="quick-qa-correct-select"
-                />
               </div>
             </v-card-text>
           </v-card>
@@ -1784,6 +2293,20 @@ onBeforeUnmount(() => {
       </template>
     </v-snackbar>
 
+    <v-snackbar
+      v-model="countdownDoneSnackbarVisible"
+      color="warning"
+      :timeout="4500"
+      location="bottom right"
+    >
+      倒數結束
+      <template #actions>
+        <v-btn variant="text" @click="countdownDoneSnackbarVisible = false"
+          >關閉</v-btn
+        >
+      </template>
+    </v-snackbar>
+
     <v-dialog v-model="openUrlDialogVisible" max-width="520">
       <v-card rounded="lg">
         <v-card-title class="text-h6">通知學生開啟網頁</v-card-title>
@@ -1804,6 +2327,34 @@ onBeforeUnmount(() => {
           <v-btn color="primary" @click="submitOpenStudentUrlCommand"
             >確定</v-btn
           >
+        </v-card-actions>
+      </v-card>
+    </v-dialog>
+
+    <v-dialog v-model="quickQaCloseDialogVisible" max-width="520">
+      <v-card rounded="lg">
+        <v-card-title class="text-h6">選擇正確答案並結束作答</v-card-title>
+        <v-card-text>
+          <div class="text-body-2 mb-3">
+            請選擇正確答案。按下後將立即結束本題作答。
+          </div>
+          <div class="d-flex flex-wrap ga-2">
+            <v-btn
+              v-for="option in QUICK_QA_OPTIONS"
+              :key="`close-quick-qa-${option}`"
+              :color="optionBadgeColor(option)"
+              variant="tonal"
+              @click="closeQuickQaQuestion(option)"
+            >
+              {{ option }}
+            </v-btn>
+            <v-btn variant="outlined" @click="closeQuickQaQuestion('none')">
+              不設定答案
+            </v-btn>
+          </div>
+        </v-card-text>
+        <v-card-actions class="justify-end">
+          <v-btn variant="text" @click="closeQuickQaCloseDialog">取消</v-btn>
         </v-card-actions>
       </v-card>
     </v-dialog>
@@ -1970,10 +2521,6 @@ onBeforeUnmount(() => {
   overflow: auto;
 }
 
-.quick-qa-correct-select {
-  min-width: 220px;
-}
-
 .whiteboard-canvas-wrap {
   min-width: 0;
   min-height: 0;
@@ -2039,6 +2586,53 @@ onBeforeUnmount(() => {
 
 .teacher-student-list-card :deep(.v-card-title > span) {
   font-size: 0.95rem;
+}
+
+.countdown-mini-card {
+  margin-top: 10px;
+}
+
+.countdown-left {
+  flex: 1;
+  min-width: 0;
+}
+
+.countdown-title {
+  font-size: 0.52rem;
+  line-height: 1;
+  letter-spacing: 0.08em;
+}
+
+.countdown-input :deep(.v-field__input) {
+  min-height: 24px;
+  padding-top: 1px;
+  padding-bottom: 1px;
+  text-align: center;
+}
+
+.countdown-input :deep(.v-field-label) {
+  font-size: 0.68rem;
+}
+
+.countdown-controls {
+  justify-content: space-between;
+}
+
+.countdown-presets-row {
+  justify-content: flex-start;
+}
+
+.countdown-control-btn {
+  width: 26px;
+  height: 26px;
+}
+
+.countdown-preset-btn {
+  min-width: 26px;
+  width: 26px;
+  height: 26px;
+  border-radius: 50%;
+  padding: 0;
 }
 
 @media (max-width: 960px) {
