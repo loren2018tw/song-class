@@ -13,7 +13,17 @@ export const WHITEBOARD_SIZE_OPTIONS = [4, 8, 12, 16, 24] as const;
 
 export type WhiteboardTool = "pen" | "eraser";
 export type WhiteboardColor = (typeof WHITEBOARD_COLOR_OPTIONS)[number];
-export type WhiteboardMode = "home" | "whiteboard" | "quick-qa";
+export type WhiteboardMode =
+  | "home"
+  | "whiteboard"
+  | "quick-qa"
+  | "teacher-broadcast";
+
+export type ActiveModule =
+  | "home"
+  | "whiteboard"
+  | "quick_qa"
+  | "teacher_screen_broadcast";
 export type WhiteboardBoardTab = "teacher-board" | "student-board";
 export type QuickQaOption = "A" | "B" | "C" | "D";
 
@@ -117,6 +127,7 @@ export type WhiteboardIncrementalEvent = WhiteboardIncrementalEventPayload & {
 
 export interface WhiteboardModeSyncMessage {
   kind: "mode-sync";
+  activeModule: ActiveModule;
   mode: WhiteboardMode;
   modeVersion: number;
   activeTab: WhiteboardBoardTab;

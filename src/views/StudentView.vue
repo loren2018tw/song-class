@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref } from "vue";
+import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import NicknameJoinCard from "../components/NicknameJoinCard.vue";
 import WhiteboardCanvas from "../components/WhiteboardCanvas.vue";
 import { useAppVersion } from "../composables/useAppVersion";
@@ -18,6 +18,7 @@ import {
   type WhiteboardIncrementalEvent,
   type WhiteboardIncrementalEventPayload,
   type WhiteboardMode,
+  type ActiveModule,
   type WhiteboardSnapshot,
   type WhiteboardSnapshotRequestMessage,
   type WhiteboardStudentEventBatchMessage,
@@ -48,6 +49,8 @@ const signalError = ref("");
 const activeMode = ref<WhiteboardMode>("home");
 const activeTab = ref<WhiteboardBoardTab>("teacher-board");
 const isTeacherBoardViewForced = ref(false);
+const teacherBroadcastVideoRef = ref<HTMLVideoElement | null>(null);
+const teacherBroadcastStream = ref<MediaStream | null>(null);
 const modeVersion = ref(0);
 const tabVersion = ref(0);
 const quickQaQuestion = ref<QuickQaQuestion | null>(null);
@@ -111,6 +114,35 @@ const quickQaFeedback = computed(() => {
 const quickQaAnswerDisabled = computed(
   () => !quickQaQuestion.value || quickQaQuestion.value.status !== "open",
 );
+
+function setTeacherBroadcastStream(stream: MediaStream | null) {
+  teacherBroadcastStream.value = stream;
+
+  const video = teacherBroadcastVideoRef.value;
+  if (!video) {
+    return;
+  }
+
+  video.srcObject = stream;
+  if (stream) {
+    void video.play().catch(() => {
+      // Ignore autoplay restrictions on first render.
+    });
+  }
+}
+
+function fromActiveModule(activeModule: ActiveModule): WhiteboardMode {
+  switch (activeModule) {
+    case "home":
+      return "home";
+    case "whiteboard":
+      return "whiteboard";
+    case "quick_qa":
+      return "quick-qa";
+    case "teacher_screen_broadcast":
+      return "teacher-broadcast";
+  }
+}
 
 function optionBadgeColor(option: QuickQaOption): string {
   switch (option) {
@@ -347,6 +379,7 @@ function resetToJoinState(message = "連線已中斷，請重新加入") {
   teacherSnapshot.value = createEmptyWhiteboardSnapshot();
   studentSnapshot.value = createEmptyWhiteboardSnapshot();
   quickQaQuestion.value = null;
+  setTeacherBroadcastStream(null);
   studentNextSequence = 1;
   teacherStudentLastAppliedSequence.value = 0;
   queuedStudentEvents.length = 0;
@@ -455,6 +488,22 @@ function ensureSocket() {
         );
         await flushQueuedCandidates();
         statusText.value = "WebRTC 協商完成，等待連線建立...";
+        return;
+      }
+
+      if (message.event === "offer" && message.payload && peer) {
+        await peer.setRemoteDescription(
+          message.payload as RTCSessionDescriptionInit,
+        );
+        await flushQueuedCandidates();
+        const answer = await peer.createAnswer();
+        await peer.setLocalDescription(answer);
+        sendSignal({
+          event: "answer",
+          source: selfId,
+          target: teacherId,
+          payload: answer,
+        });
         return;
       }
 
@@ -632,7 +681,12 @@ function handleLessonMessage(raw: string) {
 
     modeVersion.value = parsed.modeVersion;
     tabVersion.value = parsed.tabVersion;
-    activeMode.value = parsed.mode;
+    activeMode.value = parsed.activeModule
+      ? fromActiveModule(parsed.activeModule)
+      : parsed.mode;
+    if (parsed.mode === "teacher-broadcast") {
+      activeTab.value = "teacher-board";
+    }
     return;
   }
 
@@ -881,6 +935,14 @@ async function startOffer() {
         resetToJoinState("連線已中斷，請重新加入");
       }
     },
+    onTrack: (event) => {
+      const [stream] = event.streams;
+      if (!stream) {
+        return;
+      }
+
+      setTeacherBroadcastStream(stream);
+    },
   });
 
   const channel = peer.createDataChannel("lesson");
@@ -937,6 +999,24 @@ onMounted(() => {
   attemptResumeReconnect("頁面載入");
 });
 
+watch([teacherBroadcastVideoRef, teacherBroadcastStream], () => {
+  const video = teacherBroadcastVideoRef.value;
+  const stream = teacherBroadcastStream.value;
+  if (!video) {
+    return;
+  }
+
+  if (video.srcObject !== stream) {
+    video.srcObject = stream;
+  }
+
+  if (stream) {
+    void video.play().catch(() => {
+      // Ignore autoplay restrictions when user has not interacted.
+    });
+  }
+});
+
 onBeforeUnmount(() => {
   document.removeEventListener("visibilitychange", handleVisibilityChange);
   window.removeEventListener("pageshow", handlePageShow);
@@ -991,7 +1071,9 @@ onBeforeUnmount(() => {
               class="d-flex align-center justify-center py-16"
             >
               <v-card-text class="text-center">
-                <div class="text-h4 font-weight-black mb-2">請專心學習</div>
+                <div class="text-display-large font-weight-black mb-2">
+                  請專心學習
+                </div>
                 <div class="text-medium-emphasis">等待教師切換課堂功能</div>
               </v-card-text>
             </v-card>
@@ -1090,6 +1172,24 @@ onBeforeUnmount(() => {
         </div>
       </div>
 
+      <div
+        v-else-if="activeMode === 'teacher-broadcast'"
+        class="student-broadcast-screen"
+      >
+        <div class="student-broadcast-shell">
+          <div class="student-broadcast-overlay text-body-2 font-weight-bold">
+            教師畫面廣播中
+          </div>
+          <video
+            ref="teacherBroadcastVideoRef"
+            class="teacher-broadcast-video"
+            autoplay
+            playsinline
+            controls
+          />
+        </div>
+      </div>
+
       <div v-else class="student-whiteboard-screen">
         <v-tabs
           color="primary"
@@ -1172,6 +1272,45 @@ onBeforeUnmount(() => {
 .student-quick-qa-screen {
   min-height: 100dvh;
   padding: 14px;
+}
+
+.student-broadcast-screen {
+  height: 100%;
+  max-height: 100%;
+  padding: 10px;
+  box-sizing: border-box;
+  overflow: hidden;
+}
+
+.student-broadcast-shell {
+  width: 100%;
+  height: 100%;
+  min-height: 0;
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  overflow: hidden;
+}
+
+.student-broadcast-overlay {
+  position: absolute;
+  top: 8px;
+  left: 8px;
+  z-index: 1;
+  color: rgba(var(--v-theme-on-surface), 0.92);
+  background: rgba(255, 255, 255, 0.72);
+  padding: 6px 10px;
+  border-radius: 999px;
+}
+
+.teacher-broadcast-video {
+  width: 100%;
+  height: 100%;
+  min-height: 0;
+  border-radius: 10px;
+  background: #101418;
+  object-fit: contain;
 }
 
 .student-quick-qa-shell {

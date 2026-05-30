@@ -21,3 +21,15 @@ export interface SignalEnvelope {
   payload?: unknown;
   message?: string;
 }
+
+export type ActiveModule =
+  | "home"
+  | "whiteboard"
+  | "quick_qa"
+  | "teacher_screen_broadcast";
+
+export interface LessonModuleState {
+  activeModule: ActiveModule;
+  modeVersion: number;
+  tabVersion: number;
+}

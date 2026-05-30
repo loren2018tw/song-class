@@ -179,12 +179,22 @@ async fn app_version() -> impl IntoResponse {
     )
 }
 
-async fn student_page() -> impl IntoResponse {
-    Redirect::temporary("/app?mode=student")
+fn redirect_to_app_mode(mode: &str, base: Option<&str>) -> Redirect {
+    let target = if let Some(base_url) = base.filter(|value| !value.trim().is_empty()) {
+        format!("/app?mode={mode}&base={base_url}")
+    } else {
+        format!("/app?mode={mode}")
+    };
+
+    Redirect::temporary(&target)
 }
 
-async fn teacher_page() -> impl IntoResponse {
-    Redirect::temporary("/app?mode=teacher")
+async fn student_page(Query(query): Query<HashMap<String, String>>) -> impl IntoResponse {
+    redirect_to_app_mode("student", query.get("base").map(String::as_str))
+}
+
+async fn teacher_page(Query(query): Query<HashMap<String, String>>) -> impl IntoResponse {
+    redirect_to_app_mode("teacher", query.get("base").map(String::as_str))
 }
 
 fn resolve_vite_host_from_header(host_header: &str) -> String {
@@ -682,9 +692,9 @@ async fn get_server_debug_info(
             .collect(),
         executable_path,
         tauri_resource_dir,
-        app_teacher_url: format!("{base_url}/teacher"),
+        app_teacher_url: format!("http://127.0.0.1:{DEFAULT_PORT}/teacher?base={base_url}"),
         app_student_url: format!("{base_url}/student"),
-        teacher_redirect_url: format!("{base_url}/teacher"),
+        teacher_redirect_url: format!("http://127.0.0.1:{DEFAULT_PORT}/teacher?base={base_url}"),
         student_redirect_url: format!("{base_url}/student"),
     })
 }

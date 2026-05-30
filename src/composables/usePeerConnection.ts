@@ -2,6 +2,7 @@ export interface PeerConnectionOptions {
   onIceCandidate?: (candidate: RTCIceCandidate) => void;
   onDataChannel?: (channel: RTCDataChannel) => void;
   onConnectionStateChange?: (state: RTCPeerConnectionState) => void;
+  onTrack?: (event: RTCTrackEvent) => void;
 }
 
 export function createPeerConnection(options: PeerConnectionOptions = {}) {
@@ -25,6 +26,12 @@ export function createPeerConnection(options: PeerConnectionOptions = {}) {
   connection.onconnectionstatechange = () => {
     if (options.onConnectionStateChange) {
       options.onConnectionStateChange(connection.connectionState);
+    }
+  };
+
+  connection.ontrack = (event) => {
+    if (options.onTrack) {
+      options.onTrack(event);
     }
   };
 

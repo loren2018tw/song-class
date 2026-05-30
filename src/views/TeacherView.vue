@@ -49,17 +49,28 @@ const teacherBrowserUrl = computed(() => {
     return base.toString();
   }
 
-  return `${serverInfo.value.url}/teacher`;
+  const localTeacherUrl = new URL(serverInfo.value.url);
+  localTeacherUrl.hostname = "127.0.0.1";
+  localTeacherUrl.pathname = "/teacher";
+  localTeacherUrl.searchParams.set("base", serverInfo.value.url);
+  return localTeacherUrl.toString();
 });
 
 const importantRoutes = computed(() => {
   const base = serverInfo.value.url;
+  const teacherUrl = new URL(base);
+  teacherUrl.hostname = "127.0.0.1";
+  teacherUrl.pathname = "/teacher";
+  teacherUrl.searchParams.set("base", base);
+
+  const studentUrl = new URL("/student", base);
+
   return {
     base,
-    teacherRedirect: `${base}/teacher`,
-    studentRedirect: `${base}/student`,
-    appTeacher: `${base}/teacher`,
-    appStudent: `${base}/student`,
+    teacherRedirect: teacherUrl.toString(),
+    studentRedirect: studentUrl.toString(),
+    appTeacher: teacherUrl.toString(),
+    appStudent: studentUrl.toString(),
     health: `${base}/health`,
   };
 });

@@ -27,6 +27,7 @@ import {
   type QuickQaOption,
   type QuickQaQuestion,
   type QuickQaStateMessage,
+  type ActiveModule,
   type WhiteboardBoardTab,
   type WhiteboardEventBatchMessage,
   type WhiteboardIncrementalEvent,
@@ -77,6 +78,9 @@ const quickQaResultView = ref<"summary" | "details">("summary");
 const quickQaCloseDialogVisible = ref(false);
 const quickQaStageCorrectCounts = reactive(new Map<string, number>());
 const knownStudentNames = reactive(new Map<string, string>());
+const teacherBroadcastStarting = ref(false);
+const teacherBroadcastStream = ref<MediaStream | null>(null);
+const broadcastQualityPreset = ref<"balanced" | "low">("balanced");
 
 const whiteboardBackgroundOptions = [
   { fileName: null, displayName: "空白" },
@@ -119,6 +123,7 @@ const coeditStudentId = ref<string | null>(null);
 const peers = new Map<string, RTCPeerConnection>();
 const pendingCandidates = new Map<string, RTCIceCandidateInit[]>();
 const lessonChannels = new Map<string, RTCDataChannel>();
+const teacherBroadcastSenders = new Map<string, RTCRtpSender>();
 
 const queuedTeacherEvents: WhiteboardIncrementalEvent[] = [];
 let nextTeacherSequence = 1;
@@ -138,10 +143,6 @@ const wsUrl = computed(() => {
   base.search = "?role=teacher";
   return base.toString();
 });
-const studentJoinUrl = computed(() => {
-  const studentUrl = new URL("/", props.baseUrl);
-  return studentUrl.toString();
-});
 const countdownPauseResumeIcon = computed(() =>
   countdownRunning.value ? "mdi-pause" : "mdi-play",
 );
@@ -153,6 +154,56 @@ const countdownPauseResumeTooltip = computed(() =>
       : "開始",
 );
 const countdownMinutePresets = [1, 5, 10, 15] as const;
+const teacherBroadcastActive = computed(
+  () => activeFeature.value === "teacher-broadcast",
+);
+const studentJoinUrl = computed(() => {
+  return new URL("/student", props.baseUrl).toString();
+});
+const teacherBroadcastCaptureSupportError = computed(() => {
+  if (!window.isSecureContext) {
+    return "教師廣播需要在安全來源下執行，請改從 localhost 開啟教師端。";
+  }
+
+  if (!navigator.mediaDevices?.getDisplayMedia) {
+    return "目前瀏覽器環境不支援螢幕擷取。";
+  }
+
+  return "";
+});
+const broadcastQualityOptions = [
+  { value: "balanced", title: "720p / 15fps" },
+  { value: "low", title: "540p / 10fps" },
+] as const;
+
+function toActiveModule(mode: WhiteboardMode): ActiveModule {
+  switch (mode) {
+    case "home":
+      return "home";
+    case "whiteboard":
+      return "whiteboard";
+    case "quick-qa":
+      return "quick_qa";
+    case "teacher-broadcast":
+      return "teacher_screen_broadcast";
+  }
+}
+
+function toBroadcastCaptureConstraints() {
+  if (broadcastQualityPreset.value === "low") {
+    return {
+      width: { ideal: 960, max: 960 },
+      height: { ideal: 540, max: 540 },
+      frameRate: { ideal: 10, max: 10 },
+    };
+  }
+
+  return {
+    width: { ideal: 1280, max: 1280 },
+    height: { ideal: 720, max: 720 },
+    frameRate: { ideal: 15, max: 15 },
+  };
+}
 
 async function openStudentQrDialogAndCopyUrl() {
   studentQrDialogVisible.value = true;
@@ -339,6 +390,140 @@ function sendSignal(payload: SignalEnvelope) {
   }
 }
 
+async function renegotiatePeer(studentId: string) {
+  const peer = peers.get(studentId);
+  if (!peer || peer.signalingState !== "stable") {
+    return;
+  }
+
+  try {
+    const offer = await peer.createOffer();
+    await peer.setLocalDescription(offer);
+    sendSignal({
+      event: "offer",
+      target: studentId,
+      payload: offer,
+    });
+  } catch (error) {
+    showRtcError(`重新協商失敗(${studentId}): ${String(error)}`);
+  }
+}
+
+function attachBroadcastTrackToStudent(studentId: string) {
+  const peer = peers.get(studentId);
+  const stream = teacherBroadcastStream.value;
+  const track = stream?.getVideoTracks()[0];
+  if (!peer || !stream || !track) {
+    return;
+  }
+
+  const existingSender = teacherBroadcastSenders.get(studentId);
+  if (existingSender) {
+    void existingSender.replaceTrack(track);
+    return;
+  }
+
+  const sender = peer.addTrack(track, stream);
+  teacherBroadcastSenders.set(studentId, sender);
+  void renegotiatePeer(studentId);
+}
+
+function stopTeacherBroadcastTrack() {
+  const stream = teacherBroadcastStream.value;
+  if (!stream) {
+    return;
+  }
+
+  for (const track of stream.getTracks()) {
+    track.stop();
+  }
+  teacherBroadcastStream.value = null;
+}
+
+function detachBroadcastFromAllPeers() {
+  for (const [studentId, sender] of teacherBroadcastSenders.entries()) {
+    const peer = peers.get(studentId);
+    if (!peer) {
+      continue;
+    }
+
+    try {
+      peer.removeTrack(sender);
+      void renegotiatePeer(studentId);
+    } catch {
+      // Ignore remove failures on stale peer state.
+    }
+  }
+
+  teacherBroadcastSenders.clear();
+}
+
+function stopTeacherBroadcast(toMode: WhiteboardMode = "home") {
+  if (!teacherBroadcastStream.value && teacherBroadcastSenders.size === 0) {
+    if (activeFeature.value === "teacher-broadcast") {
+      applyFeatureMode(toMode);
+    }
+    return;
+  }
+
+  detachBroadcastFromAllPeers();
+  stopTeacherBroadcastTrack();
+
+  if (activeFeature.value === "teacher-broadcast") {
+    applyFeatureMode(toMode);
+  }
+}
+
+async function startTeacherBroadcast() {
+  if (teacherBroadcastStarting.value) {
+    return;
+  }
+
+  const supportError = teacherBroadcastCaptureSupportError.value;
+  if (supportError) {
+    showRtcError(`啟動教師廣播失敗: ${supportError}`);
+    return;
+  }
+
+  teacherBroadcastStarting.value = true;
+  try {
+    const mediaStream = await navigator.mediaDevices.getDisplayMedia({
+      video: toBroadcastCaptureConstraints(),
+      audio: false,
+    });
+
+    const [videoTrack] = mediaStream.getVideoTracks();
+    if (!videoTrack) {
+      throw new Error("未取得螢幕視訊軌");
+    }
+
+    videoTrack.onended = () => {
+      stopTeacherBroadcast("home");
+    };
+
+    teacherBroadcastStream.value = mediaStream;
+    applyFeatureMode("teacher-broadcast");
+
+    for (const studentId of peers.keys()) {
+      attachBroadcastTrackToStudent(studentId);
+    }
+  } catch (error) {
+    showRtcError(`啟動教師廣播失敗: ${String(error)}`);
+    stopTeacherBroadcastTrack();
+  } finally {
+    teacherBroadcastStarting.value = false;
+  }
+}
+
+async function toggleTeacherBroadcast() {
+  if (teacherBroadcastActive.value) {
+    stopTeacherBroadcast("home");
+    return;
+  }
+
+  await startTeacherBroadcast();
+}
+
 function showRtcError(message: string) {
   rtcError.value = message;
   rtcErrorVisible.value = true;
@@ -517,6 +702,7 @@ function applyCountdownMinutePreset(minutes: number) {
 function toModeMessage(): WhiteboardModeSyncMessage {
   return {
     kind: "mode-sync",
+    activeModule: toActiveModule(activeFeature.value),
     mode: activeFeature.value,
     modeVersion: modeVersion.value,
     activeTab: activeWhiteboardTab.value,
@@ -1182,6 +1368,11 @@ function handleCoeditStudentSyncEvent(
 }
 
 function applyFeatureMode(mode: WhiteboardMode) {
+  if (mode !== "teacher-broadcast" && teacherBroadcastActive.value) {
+    stopTeacherBroadcastTrack();
+    detachBroadcastFromAllPeers();
+  }
+
   if (activeFeature.value === mode) {
     return;
   }
@@ -1489,6 +1680,9 @@ function bindLessonChannel(studentId: string, channel: RTCDataChannel) {
 
   channel.onopen = () => {
     pushBootstrapToStudent(studentId);
+    if (teacherBroadcastActive.value) {
+      attachBroadcastTrackToStudent(studentId);
+    }
   };
 
   channel.onmessage = (event) => {
@@ -1586,6 +1780,7 @@ function disposeStudentConnection(studentId: string) {
   }
 
   pendingCandidates.delete(studentId);
+  teacherBroadcastSenders.delete(studentId);
   studentBoardSnapshots.delete(studentId);
   studentBoardLastSequence.delete(studentId);
   teacherToStudentLastSequence.delete(studentId);
@@ -1650,8 +1845,24 @@ async function handleSignal(message: SignalEnvelope) {
         target: message.source,
         payload: answer,
       });
+      if (teacherBroadcastActive.value) {
+        attachBroadcastTrackToStudent(message.source);
+      }
     } catch (error) {
       showRtcError(`教師端 WebRTC 錯誤: ${String(error)}`);
+    }
+    return;
+  }
+
+  if (message.event === "answer" && message.source && message.payload) {
+    try {
+      const peer = ensurePeer(message.source);
+      await peer.setRemoteDescription(
+        message.payload as RTCSessionDescriptionInit,
+      );
+      await flushQueuedCandidates(message.source);
+    } catch (error) {
+      showRtcError(`教師端重協商失敗: ${String(error)}`);
     }
     return;
   }
@@ -1739,6 +1950,8 @@ onMounted(() => {
 });
 
 onBeforeUnmount(() => {
+  stopTeacherBroadcastTrack();
+
   stopCountdownTimer();
 
   if (countdownAudioContext) {
@@ -1768,6 +1981,7 @@ onBeforeUnmount(() => {
 
   peers.clear();
   lessonChannels.clear();
+  teacherBroadcastSenders.clear();
   pendingCandidates.clear();
   studentBoardSnapshots.clear();
   studentBoardLastSequence.clear();
@@ -1808,7 +2022,7 @@ onBeforeUnmount(() => {
         <span class="app-version-text">{{ appVersionLabel }}</span>
       </template>
     </v-app-bar>
-    <v-navigation-drawer :width="200" permanent>
+    <v-navigation-drawer :width="240" permanent>
       <div>
         <p class="text-medium-emphasis mb-0">WebSocket: {{ wsStatus }}</p>
       </div>
@@ -1834,10 +2048,39 @@ onBeforeUnmount(() => {
         >
           快問快答
         </v-btn>
+        <v-btn
+          color="deep-orange"
+          :loading="teacherBroadcastStarting"
+          :disabled="
+            !!teacherBroadcastCaptureSupportError && !teacherBroadcastActive
+          "
+          :variant="teacherBroadcastActive ? 'flat' : 'outlined'"
+          @click="toggleTeacherBroadcast"
+        >
+          {{ teacherBroadcastActive ? "停止廣播" : "廣播教師畫面" }}
+        </v-btn>
         <v-btn color="info" variant="tonal" @click="openStudentUrlDialog">
           學生開啟網頁
         </v-btn>
+        <v-select
+          v-model="broadcastQualityPreset"
+          :items="broadcastQualityOptions"
+          item-title="title"
+          item-value="value"
+          density="compact"
+          hide-details
+          label="廣播畫質"
+          variant="outlined"
+        />
       </div>
+      <v-alert
+        v-if="teacherBroadcastCaptureSupportError"
+        type="warning"
+        variant="tonal"
+        class="mx-2 mt-2"
+      >
+        {{ teacherBroadcastCaptureSupportError }}
+      </v-alert>
       <v-card rounded="lg" variant="outlined" class="countdown-mini-card ma-2">
         <v-card-text class="pa-2 d-flex flex-column ga-2">
           <div class="d-flex ga-2 align-start">
@@ -2297,15 +2540,33 @@ onBeforeUnmount(() => {
         </div>
 
         <v-card
+          v-else-if="activeFeature === 'teacher-broadcast'"
+          rounded="xl"
+          elevation="8"
+          class="teacher-broadcast-card d-flex align-center justify-center"
+        >
+          <v-card-text class="text-center py-16">
+            <div class="text-display-large font-weight-black mb-3">
+              教室畫面廣播中
+            </div>
+            <div class="text-medium-emphasis">
+              教師螢幕已透過 WebRTC 廣播到所有學生端
+            </div>
+          </v-card-text>
+        </v-card>
+
+        <v-card
           v-else
           rounded="xl"
           elevation="6"
           class="h-100 d-flex align-center justify-center"
         >
           <v-card-text class="text-center py-16">
-            <div class="text-h5 font-weight-black mb-2">請專心學習</div>
+            <div class="text-display-large font-weight-black mb-2">
+              請專心學習
+            </div>
             <div class="text-medium-emphasis">
-              教師目前在首頁模式，可隨時切換到小白版。
+              教師目前在首頁模式，可隨時切換到其他模組。
             </div>
           </v-card-text>
         </v-card>
@@ -2549,6 +2810,10 @@ onBeforeUnmount(() => {
   display: grid;
   grid-template-columns: minmax(0, 1fr) 320px;
   gap: 12px;
+}
+
+.teacher-broadcast-card {
+  height: 100%;
 }
 
 .quick-qa-editor-card,
