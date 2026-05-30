@@ -270,6 +270,22 @@ const quickQaDetailsByOption = computed(() =>
     })),
   })),
 );
+const quickQaStudentStatuses = computed(() => {
+  const collator = new Intl.Collator("zh-Hant", {
+    numeric: true,
+    sensitivity: "base",
+  });
+
+  return [...students.value]
+    .sort((left, right) => collator.compare(left.nickname, right.nickname))
+    .map((student) => ({
+      id: student.connection_id,
+      nickname: student.nickname,
+      answered:
+        quickQaQuestion.value?.answersByStudent[student.connection_id] !==
+        undefined,
+    }));
+});
 const quickQaLeaderboardTop10 = computed(() => {
   return [...quickQaStageCorrectCounts.entries()]
     .map(([studentId, score]) => ({
@@ -2378,7 +2394,9 @@ onBeforeUnmount(() => {
               class="quick-qa-result-card"
             >
               <v-card-title class="d-flex align-center justify-space-between">
-                <span class="text-h6">即時數據</span>
+                <span class="text-h6">
+                  {{ quickQaIsOpen ? "作答狀態" : "作答詳情" }}
+                </span>
                 <v-chip
                   :color="quickQaIsOpen ? 'success' : 'primary'"
                   variant="tonal"
@@ -2391,105 +2409,140 @@ onBeforeUnmount(() => {
                 v-if="quickQaHasQuestion"
                 class="d-flex flex-column ga-3"
               >
-                <v-card variant="tonal" color="primary" rounded="lg">
-                  <v-card-text class="py-3">
-                    <div class="text-caption text-medium-emphasis">
-                      參與人數
-                    </div>
-                    <div class="text-h4 font-weight-black">
-                      {{ quickQaTotalAnswers }}/{{ students.length }}
-                    </div>
-                  </v-card-text>
-                </v-card>
+                <template v-if="quickQaIsOpen">
+                  <v-card variant="tonal" color="primary" rounded="lg">
+                    <v-card-text class="py-3">
+                      <div class="text-caption text-medium-emphasis">
+                        已作答 / 已連線
+                      </div>
+                      <div class="text-h4 font-weight-black">
+                        {{ quickQaTotalAnswers }}/{{ students.length }}
+                      </div>
+                    </v-card-text>
+                  </v-card>
 
-                <v-tabs
-                  density="compact"
-                  color="primary"
-                  :model-value="quickQaResultView"
-                  @update:model-value="
-                    quickQaResultView = $event as 'summary' | 'details'
-                  "
-                >
-                  <v-tab value="summary">統計</v-tab>
-                  <v-tab value="details">明細</v-tab>
-                </v-tabs>
+                  <div class="d-flex flex-wrap ga-2">
+                    <v-chip
+                      v-for="student in quickQaStudentStatuses"
+                      :key="`quick-qa-student-${student.id}`"
+                      :color="student.answered ? 'success' : undefined"
+                      :prepend-icon="student.answered ? 'mdi-check' : undefined"
+                      :variant="student.answered ? 'flat' : 'outlined'"
+                      size="small"
+                    >
+                      {{ student.nickname }}
+                    </v-chip>
+                  </div>
 
-                <div
-                  v-if="quickQaResultView === 'summary'"
-                  class="d-flex flex-column ga-2"
-                >
-                  <v-card
-                    v-for="stat in quickQaStats"
-                    :key="`summary-${stat.option}`"
-                    rounded="lg"
-                    variant="tonal"
+                  <div
+                    v-if="quickQaStudentStatuses.length === 0"
+                    class="text-body-2 text-medium-emphasis"
                   >
-                    <v-card-text class="py-2">
-                      <div class="d-flex align-center justify-space-between">
-                        <div class="d-flex align-center ga-2">
-                          <v-chip
-                            :color="optionBadgeColor(stat.option)"
-                            size="small"
-                            variant="flat"
-                          >
-                            {{ stat.option }}
-                          </v-chip>
-                          <span class="font-weight-bold"
-                            >{{ stat.count }} 票</span
+                    目前沒有連線中的學生
+                  </div>
+                </template>
+
+                <template v-else>
+                  <v-card variant="tonal" color="primary" rounded="lg">
+                    <v-card-text class="py-3">
+                      <div class="text-caption text-medium-emphasis">
+                        參與人數
+                      </div>
+                      <div class="text-h4 font-weight-black">
+                        {{ quickQaTotalAnswers }}/{{ students.length }}
+                      </div>
+                    </v-card-text>
+                  </v-card>
+
+                  <v-tabs
+                    density="compact"
+                    color="primary"
+                    :model-value="quickQaResultView"
+                    @update:model-value="
+                      quickQaResultView = $event as 'summary' | 'details'
+                    "
+                  >
+                    <v-tab value="summary">統計</v-tab>
+                    <v-tab value="details">明細</v-tab>
+                  </v-tabs>
+
+                  <div
+                    v-if="quickQaResultView === 'summary'"
+                    class="d-flex flex-column ga-2"
+                  >
+                    <v-card
+                      v-for="stat in quickQaStats"
+                      :key="`summary-${stat.option}`"
+                      rounded="lg"
+                      variant="tonal"
+                    >
+                      <v-card-text class="py-2">
+                        <div class="d-flex align-center justify-space-between">
+                          <div class="d-flex align-center ga-2">
+                            <v-chip
+                              :color="optionBadgeColor(stat.option)"
+                              size="small"
+                              variant="flat"
+                            >
+                              {{ stat.option }}
+                            </v-chip>
+                            <span class="font-weight-bold"
+                              >{{ stat.count }} 票</span
+                            >
+                          </div>
+                          <span class="text-medium-emphasis"
+                            >{{ stat.percentage }}%</span
                           >
                         </div>
-                        <span class="text-medium-emphasis"
-                          >{{ stat.percentage }}%</span
-                        >
-                      </div>
-                      <v-progress-linear
-                        class="mt-2"
-                        rounded
-                        :model-value="stat.percentage"
-                        :color="optionBadgeColor(stat.option)"
-                        height="8"
-                      />
-                    </v-card-text>
-                  </v-card>
-                </div>
-
-                <div v-else class="d-flex flex-column ga-2">
-                  <v-card
-                    v-for="optionGroup in quickQaDetailsByOption"
-                    :key="`detail-${optionGroup.option}`"
-                    rounded="lg"
-                    variant="outlined"
-                  >
-                    <v-card-title
-                      class="py-2 text-subtitle-1 d-flex align-center ga-2"
-                    >
-                      <v-chip
-                        :color="optionBadgeColor(optionGroup.option)"
-                        size="small"
-                        variant="flat"
-                      >
-                        {{ optionGroup.option }}
-                      </v-chip>
-                      <span>{{ optionGroup.count }} 人</span>
-                    </v-card-title>
-                    <v-card-text class="pt-0">
-                      <v-list
-                        v-if="optionGroup.students.length > 0"
-                        density="compact"
-                        class="pa-0"
-                      >
-                        <v-list-item
-                          v-for="student in optionGroup.students"
-                          :key="`detail-${optionGroup.option}-${student.id}`"
-                          :title="student.nickname"
+                        <v-progress-linear
+                          class="mt-2"
+                          rounded
+                          :model-value="stat.percentage"
+                          :color="optionBadgeColor(stat.option)"
+                          height="8"
                         />
-                      </v-list>
-                      <div v-else class="text-body-2 text-medium-emphasis">
-                        尚無作答
-                      </div>
-                    </v-card-text>
-                  </v-card>
-                </div>
+                      </v-card-text>
+                    </v-card>
+                  </div>
+
+                  <div v-else class="d-flex flex-column ga-2">
+                    <v-card
+                      v-for="optionGroup in quickQaDetailsByOption"
+                      :key="`detail-${optionGroup.option}`"
+                      rounded="lg"
+                      variant="outlined"
+                    >
+                      <v-card-title
+                        class="py-2 text-subtitle-1 d-flex align-center ga-2"
+                      >
+                        <v-chip
+                          :color="optionBadgeColor(optionGroup.option)"
+                          size="small"
+                          variant="flat"
+                        >
+                          {{ optionGroup.option }}
+                        </v-chip>
+                        <span>{{ optionGroup.count }} 人</span>
+                      </v-card-title>
+                      <v-card-text class="pt-0">
+                        <v-list
+                          v-if="optionGroup.students.length > 0"
+                          density="compact"
+                          class="pa-0"
+                        >
+                          <v-list-item
+                            v-for="student in optionGroup.students"
+                            :key="`detail-${optionGroup.option}-${student.id}`"
+                            :title="student.nickname"
+                          />
+                        </v-list>
+                        <div v-else class="text-body-2 text-medium-emphasis">
+                          尚無作答
+                        </div>
+                      </v-card-text>
+                    </v-card>
+                  </div>
+                </template>
               </v-card-text>
 
               <v-card-text v-else class="text-medium-emphasis">
