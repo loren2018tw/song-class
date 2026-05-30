@@ -157,11 +157,42 @@ const countdownMinutePresets = [1, 5, 10, 15] as const;
 async function openStudentQrDialogAndCopyUrl() {
   studentQrDialogVisible.value = true;
 
+  await copyStudentJoinUrl();
+}
+
+function copyTextWithExecCommand(text: string): boolean {
+  const textarea = document.createElement("textarea");
+  textarea.value = text;
+  textarea.setAttribute("readonly", "true");
+  textarea.style.position = "fixed";
+  textarea.style.opacity = "0";
+  textarea.style.pointerEvents = "none";
+  textarea.style.zIndex = "-1";
+  document.body.appendChild(textarea);
+  textarea.focus();
+  textarea.select();
+
+  let copied = false;
+  try {
+    copied = document.execCommand("copy");
+  } finally {
+    document.body.removeChild(textarea);
+  }
+
+  return copied;
+}
+
+async function copyStudentJoinUrl() {
   try {
     await navigator.clipboard.writeText(studentJoinUrl.value);
+    return;
   } catch {
-    showRtcError("無法複製學生端連結，請手動複製。");
+    if (copyTextWithExecCommand(studentJoinUrl.value)) {
+      return;
+    }
   }
+
+  showRtcError("無法複製學生端連結，請手動複製。");
 }
 
 const quickQaStats = computed(() =>
@@ -2381,6 +2412,15 @@ onBeforeUnmount(() => {
           <div class="student-join-qr-url text-medium-emphasis">
             {{ studentJoinUrl }}
           </div>
+          <v-btn
+            class="student-join-qr-copy-btn"
+            color="primary"
+            variant="tonal"
+            prepend-icon="mdi-content-copy"
+            @click="copyStudentJoinUrl"
+          >
+            複製網址
+          </v-btn>
         </v-card-text>
       </v-card>
     </v-dialog>
@@ -2472,6 +2512,11 @@ onBeforeUnmount(() => {
   text-align: center;
   font-size: 0.8rem;
   word-break: break-all;
+}
+
+.student-join-qr-copy-btn {
+  width: 100%;
+  max-width: 320px;
 }
 
 .app-version-text {
