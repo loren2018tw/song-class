@@ -652,26 +652,13 @@ function activateEraser() {
 }
 
 function clearCanvas() {
-  const clearedBackgroundImage = normalizeBackgroundInstruction(
-    props.backgroundImage,
-  );
-
-  currentSnapshot.value = {
-    ...createEmptyWhiteboardSnapshot(),
-    backgroundImage: clearedBackgroundImage,
-  };
+  currentSnapshot.value.strokes = [];
   activeStroke.value = null;
   isDrawing.value = false;
+  drawingPointerId.value = null;
   markDrawingLayerDirty();
-  redrawAll();
+  redrawDrawingCanvas();
   emitSyncEvent({ type: "clear" });
-  emitSyncEvent({
-    type: "background-change",
-    backgroundImage: currentSnapshot.value.backgroundImage,
-    backgroundColor:
-      currentSnapshot.value.backgroundColor || WHITEBOARD_BACKGROUND_COLOR,
-  });
-  emitSnapshot();
 }
 
 watch(
