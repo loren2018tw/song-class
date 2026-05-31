@@ -19,7 +19,18 @@ function nicknameChipColor(student: StudentSession): string {
 }
 
 function nicknameChipLabel(student: StudentSession): string {
-  return student.nickname || "（未提供暱稱）";
+  if (student.seat_no_text) {
+    const rawNickname = student.nickname ?? "";
+    const trimmedNickname = rawNickname.startsWith(student.seat_no_text)
+      ? rawNickname.slice(student.seat_no_text.length)
+      : rawNickname;
+    const compactNickname = trimmedNickname.trim();
+    return compactNickname
+      ? `${student.seat_no_text}${compactNickname}`
+      : student.seat_no_text;
+  }
+
+  return student.nickname || "";
 }
 </script>
 

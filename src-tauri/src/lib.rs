@@ -1,15 +1,18 @@
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::{Query, State};
+use axum::extract::{Path, Query, State};
 use axum::http::header::{ACCESS_CONTROL_ALLOW_ORIGIN, HOST};
-use axum::http::HeaderMap;
+use axum::http::StatusCode;
+use axum::http::{HeaderMap, HeaderValue};
 use axum::response::{IntoResponse, Redirect};
-use axum::routing::get;
+use axum::routing::{get, patch, post};
 use axum::{Json, Router};
 use futures_util::{SinkExt, StreamExt};
 use local_ip_address::local_ip;
+use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tauri::menu::{Menu, MenuItem};
@@ -17,6 +20,7 @@ use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent}
 use tauri::Manager;
 use tokio::net::TcpListener;
 use tokio::sync::{mpsc, oneshot, Mutex};
+use tower_http::cors::{Any, CorsLayer};
 use tower_http::services::{ServeDir, ServeFile};
 use uuid::Uuid;
 
@@ -84,6 +88,9 @@ struct ServerHandle {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct StudentSession {
     connection_id: String,
+    student_id: i64,
+    classroom_id: i64,
+    seat_no_text: String,
     nickname: String,
     connected: bool,
     focus_status: String,
@@ -98,8 +105,32 @@ struct SessionHub {
     console_channels: HashMap<String, mpsc::UnboundedSender<String>>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+struct ClassroomSummary {
+    id: i64,
+    name: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ClassroomStudent {
+    id: i64,
+    classroom_id: i64,
+    seat_no_text: String,
+    nickname: String,
+    display_name: String,
+    occupied: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ClassroomStatePayload {
+    current_classroom: ClassroomSummary,
+    classrooms: Vec<ClassroomSummary>,
+    students: Vec<ClassroomStudent>,
+}
+
 #[derive(Clone)]
 struct HttpState {
+    runtime: Arc<Mutex<BackendRuntime>>,
     hub: Arc<Mutex<SessionHub>>,
 }
 
@@ -109,6 +140,8 @@ struct BackendRuntime {
     frontend_assets_root: PathBuf,
     frontend_assets_candidates: Vec<PathBuf>,
     tauri_resource_dir: Option<String>,
+    db_path: PathBuf,
+    current_classroom_id: i64,
     running: Option<ServerHandle>,
 }
 
@@ -122,6 +155,8 @@ impl BackendState {
         frontend_assets_root: PathBuf,
         frontend_assets_candidates: Vec<PathBuf>,
         tauri_resource_dir: Option<String>,
+        db_path: PathBuf,
+        current_classroom_id: i64,
     ) -> Self {
         Self {
             inner: Arc::new(Mutex::new(BackendRuntime {
@@ -130,6 +165,8 @@ impl BackendState {
                 frontend_assets_root,
                 frontend_assets_candidates,
                 tauri_resource_dir,
+                db_path,
+                current_classroom_id,
                 running: None,
             })),
         }
@@ -163,6 +200,45 @@ struct SignalEnvelope {
     payload: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     message: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct JoinPayload {
+    classroom_id: i64,
+    seat_no_text: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct SelectClassroomRequest {
+    classroom_id: i64,
+}
+
+#[derive(Debug, Deserialize)]
+struct UpdateClassroomRequest {
+    name: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct UpdateStudentRequest {
+    seat_no_text: String,
+    nickname: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct CreateClassroomRequest {
+    name: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SaveClassMembersRequest {
+    students: Vec<SaveClassMemberItem>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SaveClassMemberItem {
+    id: Option<i64>,
+    seat_no_text: String,
+    nickname: String,
 }
 
 #[derive(Deserialize)]
@@ -243,7 +319,7 @@ async fn ws_handler(
     State(state): State<HttpState>,
 ) -> impl IntoResponse {
     let role = query.role.unwrap_or_else(|| "student".to_string());
-    ws.on_upgrade(move |socket| handle_socket(socket, state.hub, role))
+    ws.on_upgrade(move |socket| handle_socket(socket, state.runtime, state.hub, role))
 }
 
 fn resolve_local_ip() -> String {
@@ -252,10 +328,889 @@ fn resolve_local_ip() -> String {
         .unwrap_or_else(|_| "127.0.0.1".to_string())
 }
 
+fn format_host_for_url(host: &str) -> String {
+    if host.contains(':') && !host.starts_with('[') {
+        format!("[{host}]")
+    } else {
+        host.to_string()
+    }
+}
+
 fn send_json(tx: &mpsc::UnboundedSender<String>, envelope: &SignalEnvelope) {
     if let Ok(payload) = serde_json::to_string(envelope) {
         let _ = tx.send(payload);
     }
+}
+
+fn send_ws_error(tx: &mpsc::UnboundedSender<String>, message: impl Into<String>) {
+    let message = message.into();
+    eprintln!("[ws-error] {message}");
+    send_json(
+        tx,
+        &SignalEnvelope {
+            event: "error".to_string(),
+            source: None,
+            target: None,
+            nickname: None,
+            payload: None,
+            message: Some(message),
+        },
+    );
+}
+
+fn seat_nickname_display(seat_no_text: &str, nickname: &str) -> String {
+    let trimmed = nickname.trim();
+    if trimmed.is_empty() {
+        seat_no_text.to_string()
+    } else {
+        format!("{seat_no_text}{trimmed}")
+    }
+}
+
+fn normalize_seat_no_text(raw: &str) -> String {
+    raw.trim().to_string()
+}
+
+fn init_database(db_path: &PathBuf) -> Result<i64, String> {
+    if let Some(parent) = db_path.parent() {
+        fs::create_dir_all(parent).map_err(|error| format!("建立資料庫目錄失敗: {error}"))?;
+    }
+
+    let mut conn = Connection::open(db_path).map_err(|error| format!("開啟資料庫失敗: {error}"))?;
+    conn.execute_batch(include_str!("../sql/v0.sql"))
+        .map_err(|error| format!("套用 DDL 失敗: {error}"))?;
+
+    let classroom_count: i64 = conn
+        .query_row("SELECT COUNT(1) FROM classrooms", [], |row| row.get(0))
+        .map_err(|error| format!("讀取班級數量失敗: {error}"))?;
+
+    if classroom_count == 0 {
+        conn.execute(
+            "INSERT INTO classrooms (name) VALUES (?1)",
+            params!["預設班級"],
+        )
+        .map_err(|error| format!("建立首個班級失敗: {error}"))?;
+
+        let classroom_id = conn.last_insert_rowid();
+        let tx = conn
+            .transaction()
+            .map_err(|error| format!("建立預設學生交易失敗: {error}"))?;
+        for seat in 1..=30 {
+            let seat_no_text = format!("{seat:02}");
+            tx.execute(
+                "INSERT INTO students (classroom_id, seat_no_text, nickname) VALUES (?1, ?2, ?3)",
+                params![classroom_id, seat_no_text, ""],
+            )
+            .map_err(|error| format!("建立預設學生失敗: {error}"))?;
+        }
+        tx.commit()
+            .map_err(|error| format!("提交預設學生失敗: {error}"))?;
+    }
+
+    conn.query_row(
+        "SELECT id FROM classrooms ORDER BY id ASC LIMIT 1",
+        [],
+        |row| row.get(0),
+    )
+    .map_err(|error| format!("讀取目前班級失敗: {error}"))
+}
+
+fn load_classrooms(conn: &Connection) -> Result<Vec<ClassroomSummary>, String> {
+    let mut statement = conn
+        .prepare("SELECT id, name FROM classrooms ORDER BY id ASC")
+        .map_err(|error| format!("準備班級查詢失敗: {error}"))?;
+
+    let rows = statement
+        .query_map([], |row| {
+            Ok(ClassroomSummary {
+                id: row.get(0)?,
+                name: row.get(1)?,
+            })
+        })
+        .map_err(|error| format!("查詢班級清單失敗: {error}"))?;
+
+    let mut classrooms = Vec::new();
+    for item in rows {
+        classrooms.push(item.map_err(|error| format!("讀取班級資料失敗: {error}"))?);
+    }
+    Ok(classrooms)
+}
+
+fn load_students_by_classroom(
+    conn: &Connection,
+    classroom_id: i64,
+    occupied_seats: &HashSet<String>,
+) -> Result<Vec<ClassroomStudent>, String> {
+    let mut statement = conn
+        .prepare(
+            "SELECT id, classroom_id, seat_no_text, nickname
+             FROM students
+             WHERE classroom_id = ?1
+             ORDER BY seat_no_text ASC",
+        )
+        .map_err(|error| format!("準備學生查詢失敗: {error}"))?;
+
+    let rows = statement
+        .query_map(params![classroom_id], |row| {
+            let seat_no_text: String = row.get(2)?;
+            let nickname: String = row.get(3)?;
+            Ok(ClassroomStudent {
+                id: row.get(0)?,
+                classroom_id: row.get(1)?,
+                display_name: seat_nickname_display(&seat_no_text, &nickname),
+                occupied: occupied_seats.contains(&seat_no_text),
+                seat_no_text,
+                nickname,
+            })
+        })
+        .map_err(|error| format!("查詢學生清單失敗: {error}"))?;
+
+    let mut students = Vec::new();
+    for item in rows {
+        students.push(item.map_err(|error| format!("讀取學生資料失敗: {error}"))?);
+    }
+    Ok(students)
+}
+
+async fn build_classroom_state(
+    runtime: &Arc<Mutex<BackendRuntime>>,
+) -> Result<ClassroomStatePayload, String> {
+    let (db_path, current_classroom_id, hub) = {
+        let guard = runtime.lock().await;
+        (
+            guard.db_path.clone(),
+            guard.current_classroom_id,
+            guard.hub.clone(),
+        )
+    };
+
+    let occupied_seats = {
+        let guard = hub.lock().await;
+        guard
+            .students
+            .values()
+            .filter(|student| student.classroom_id == current_classroom_id)
+            .map(|student| student.seat_no_text.clone())
+            .collect::<HashSet<_>>()
+    };
+
+    let conn = Connection::open(db_path).map_err(|error| format!("開啟資料庫失敗: {error}"))?;
+    let classrooms = load_classrooms(&conn)?;
+    let current_classroom = classrooms
+        .iter()
+        .find(|classroom| classroom.id == current_classroom_id)
+        .cloned()
+        .ok_or_else(|| "找不到目前班級".to_string())?;
+    let students = load_students_by_classroom(&conn, current_classroom_id, &occupied_seats)?;
+
+    Ok(ClassroomStatePayload {
+        current_classroom,
+        classrooms,
+        students,
+    })
+}
+
+async fn broadcast_classroom_state(runtime: &Arc<Mutex<BackendRuntime>>) {
+    let state = match build_classroom_state(runtime).await {
+        Ok(state) => state,
+        Err(error) => {
+            eprintln!("[classroom-state] build failed: {error}");
+            return;
+        }
+    };
+
+    let raw = match serde_json::to_string(&SignalEnvelope {
+        event: "classroom-state".to_string(),
+        source: None,
+        target: None,
+        nickname: None,
+        payload: Some(json!({ "state": state })),
+        message: None,
+    }) {
+        Ok(raw) => raw,
+        Err(_) => return,
+    };
+
+    let hub = {
+        let guard = runtime.lock().await;
+        guard.hub.clone()
+    };
+
+    let mut guard = hub.lock().await;
+    let mut stale = Vec::new();
+    for (id, tx) in &guard.teacher_channels {
+        if tx.send(raw.clone()).is_err() {
+            stale.push(id.clone());
+        }
+    }
+
+    for (id, tx) in &guard.console_channels {
+        if tx.send(raw.clone()).is_err() {
+            stale.push(id.clone());
+        }
+    }
+
+    for (id, tx) in &guard.student_channels {
+        if tx.send(raw.clone()).is_err() {
+            stale.push(id.clone());
+        }
+    }
+
+    for id in stale {
+        guard.teacher_channels.remove(&id);
+        guard.console_channels.remove(&id);
+        guard.student_channels.remove(&id);
+    }
+}
+
+fn api_error(status: StatusCode, message: impl Into<String>) -> (StatusCode, Json<Value>) {
+    let message = message.into();
+    eprintln!("[api-error] {status}: {message}");
+    (status, Json(json!({ "message": message })))
+}
+
+async fn get_classroom_state_handler(
+    State(state): State<HttpState>,
+) -> Result<Json<ClassroomStatePayload>, (StatusCode, Json<Value>)> {
+    let payload = build_classroom_state(&state.runtime)
+        .await
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error))?;
+    Ok(Json(payload))
+}
+
+async fn list_classrooms_handler(
+    State(state): State<HttpState>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let payload = build_classroom_state(&state.runtime)
+        .await
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error))?;
+    Ok(Json(json!({
+        "classrooms": payload.classrooms,
+        "current_classroom_id": payload.current_classroom.id
+    })))
+}
+
+async fn force_logout_classroom_students(
+    hub: &Arc<Mutex<SessionHub>>,
+    classroom_id: i64,
+    reason: &str,
+    message: &str,
+) {
+    let forced_out_ids = {
+        let guard = hub.lock().await;
+        let ids = guard
+            .students
+            .values()
+            .filter(|student| student.classroom_id == classroom_id)
+            .map(|student| student.connection_id.clone())
+            .collect::<Vec<_>>();
+
+        for id in &ids {
+            if let Some(tx) = guard.student_channels.get(id) {
+                eprintln!(
+                    "[force-logout] connection_id={id} classroom_id={classroom_id} reason={reason}"
+                );
+                send_json(
+                    tx,
+                    &SignalEnvelope {
+                        event: "force-logout".to_string(),
+                        source: None,
+                        target: Some(id.clone()),
+                        nickname: None,
+                        payload: Some(json!({ "reason": reason })),
+                        message: Some(message.to_string()),
+                    },
+                );
+            }
+        }
+        ids
+    };
+
+    if !forced_out_ids.is_empty() {
+        let mut guard = hub.lock().await;
+        for id in forced_out_ids {
+            guard.students.remove(&id);
+            guard.student_channels.remove(&id);
+        }
+    }
+}
+
+async fn select_classroom_handler(
+    State(state): State<HttpState>,
+    Json(body): Json<SelectClassroomRequest>,
+) -> Result<Json<ClassroomStatePayload>, (StatusCode, Json<Value>)> {
+    let (db_path, previous_classroom_id, runtime) = {
+        let guard = state.runtime.lock().await;
+        (
+            guard.db_path.clone(),
+            guard.current_classroom_id,
+            state.runtime.clone(),
+        )
+    };
+
+    let conn = Connection::open(db_path).map_err(|error| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("開啟資料庫失敗: {error}"),
+        )
+    })?;
+    let exists: Option<i64> = conn
+        .query_row(
+            "SELECT id FROM classrooms WHERE id = ?1",
+            params![body.classroom_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|error| {
+            api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("讀取班級失敗: {error}"),
+            )
+        })?;
+    if exists.is_none() {
+        return Err(api_error(StatusCode::NOT_FOUND, "指定班級不存在"));
+    }
+
+    if previous_classroom_id != body.classroom_id {
+        let hub = {
+            let mut guard = runtime.lock().await;
+            guard.current_classroom_id = body.classroom_id;
+            guard.hub.clone()
+        };
+
+        force_logout_classroom_students(
+            &hub,
+            previous_classroom_id,
+            "classroom-switched",
+            "班級已切換，請重新選擇座號加入",
+        )
+        .await;
+
+        broadcast_student_list(&hub).await;
+    }
+
+    broadcast_classroom_state(&runtime).await;
+    let payload = build_classroom_state(&runtime)
+        .await
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error))?;
+    Ok(Json(payload))
+}
+
+async fn update_classroom_handler(
+    State(state): State<HttpState>,
+    Path(classroom_id): Path<i64>,
+    Json(body): Json<UpdateClassroomRequest>,
+) -> Result<Json<ClassroomStatePayload>, (StatusCode, Json<Value>)> {
+    let class_name = body.name.trim();
+    if class_name.is_empty() {
+        return Err(api_error(StatusCode::BAD_REQUEST, "班級名稱不可為空"));
+    }
+
+    let runtime = state.runtime.clone();
+    let db_path = {
+        let guard = runtime.lock().await;
+        guard.db_path.clone()
+    };
+    let conn = Connection::open(db_path).map_err(|error| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("開啟資料庫失敗: {error}"),
+        )
+    })?;
+    let updated = conn
+        .execute(
+            "UPDATE classrooms SET name = ?1 WHERE id = ?2",
+            params![class_name, classroom_id],
+        )
+        .map_err(|error| {
+            api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("更新班級名稱失敗: {error}"),
+            )
+        })?;
+    if updated == 0 {
+        return Err(api_error(StatusCode::NOT_FOUND, "指定班級不存在"));
+    }
+
+    broadcast_classroom_state(&runtime).await;
+    let payload = build_classroom_state(&runtime)
+        .await
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error))?;
+    Ok(Json(payload))
+}
+
+async fn create_classroom_handler(
+    State(state): State<HttpState>,
+    Json(body): Json<CreateClassroomRequest>,
+) -> Result<Json<ClassroomStatePayload>, (StatusCode, Json<Value>)> {
+    let runtime = state.runtime.clone();
+    let db_path = {
+        let guard = runtime.lock().await;
+        guard.db_path.clone()
+    };
+    let conn = Connection::open(db_path).map_err(|error| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("開啟資料庫失敗: {error}"),
+        )
+    })?;
+
+    let suggested_name = format!(
+        "新班級{}",
+        conn.query_row("SELECT COUNT(1) FROM classrooms", [], |row| row
+            .get::<_, i64>(0))
+            .map_err(|error| {
+                api_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("讀取班級數量失敗: {error}"),
+                )
+            })?
+            + 1
+    );
+    let class_name = body.name.unwrap_or(suggested_name).trim().to_string();
+    if class_name.is_empty() {
+        return Err(api_error(StatusCode::BAD_REQUEST, "班級名稱不可為空"));
+    }
+
+    conn.execute(
+        "INSERT INTO classrooms (name) VALUES (?1)",
+        params![class_name],
+    )
+    .map_err(|error| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("建立班級失敗: {error}"),
+        )
+    })?;
+
+    broadcast_classroom_state(&runtime).await;
+    let payload = build_classroom_state(&runtime)
+        .await
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error))?;
+    Ok(Json(payload))
+}
+
+async fn delete_classroom_handler(
+    State(state): State<HttpState>,
+    Path(classroom_id): Path<i64>,
+) -> Result<Json<ClassroomStatePayload>, (StatusCode, Json<Value>)> {
+    let runtime = state.runtime.clone();
+    let (db_path, current_classroom_id, hub) = {
+        let guard = runtime.lock().await;
+        (
+            guard.db_path.clone(),
+            guard.current_classroom_id,
+            guard.hub.clone(),
+        )
+    };
+    let conn = Connection::open(db_path).map_err(|error| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("開啟資料庫失敗: {error}"),
+        )
+    })?;
+
+    let class_count: i64 = conn
+        .query_row("SELECT COUNT(1) FROM classrooms", [], |row| row.get(0))
+        .map_err(|error| {
+            api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("讀取班級數量失敗: {error}"),
+            )
+        })?;
+    if class_count <= 1 {
+        return Err(api_error(StatusCode::BAD_REQUEST, "無法刪除唯一的班級"));
+    }
+
+    let exists: Option<i64> = conn
+        .query_row(
+            "SELECT id FROM classrooms WHERE id = ?1",
+            params![classroom_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|error| {
+            api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("讀取班級失敗: {error}"),
+            )
+        })?;
+    if exists.is_none() {
+        return Err(api_error(StatusCode::NOT_FOUND, "指定班級不存在"));
+    }
+
+    let next_classroom_id: i64 = conn
+        .query_row(
+            "SELECT id FROM classrooms WHERE id != ?1 ORDER BY id ASC LIMIT 1",
+            params![classroom_id],
+            |row| row.get(0),
+        )
+        .map_err(|error| {
+            api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("讀取替代班級失敗: {error}"),
+            )
+        })?;
+
+    conn.execute(
+        "DELETE FROM classrooms WHERE id = ?1",
+        params![classroom_id],
+    )
+    .map_err(|error| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("刪除班級失敗: {error}"),
+        )
+    })?;
+
+    if current_classroom_id == classroom_id {
+        let mut guard = runtime.lock().await;
+        guard.current_classroom_id = next_classroom_id;
+    }
+
+    force_logout_classroom_students(
+        &hub,
+        classroom_id,
+        "classroom-deleted",
+        "班級已刪除，請重新選擇座號加入",
+    )
+    .await;
+    broadcast_student_list(&hub).await;
+
+    broadcast_classroom_state(&runtime).await;
+    let payload = build_classroom_state(&runtime)
+        .await
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error))?;
+    Ok(Json(payload))
+}
+
+async fn save_class_members_handler(
+    State(state): State<HttpState>,
+    Path(classroom_id): Path<i64>,
+    Json(body): Json<SaveClassMembersRequest>,
+) -> Result<Json<ClassroomStatePayload>, (StatusCode, Json<Value>)> {
+    let mut normalized = Vec::with_capacity(body.students.len());
+    let mut seat_set = HashSet::new();
+    for row in body.students {
+        let seat_no_text = normalize_seat_no_text(&row.seat_no_text);
+        if seat_no_text.is_empty() {
+            return Err(api_error(StatusCode::BAD_REQUEST, "座號不可為空"));
+        }
+        if !seat_set.insert(seat_no_text.clone()) {
+            return Err(api_error(StatusCode::CONFLICT, "座號不可重複"));
+        }
+        normalized.push((row.id, seat_no_text, row.nickname));
+    }
+
+    let runtime = state.runtime.clone();
+    let (db_path, hub) = {
+        let guard = runtime.lock().await;
+        (guard.db_path.clone(), guard.hub.clone())
+    };
+    let active_students = {
+        let mut conn = Connection::open(db_path).map_err(|error| {
+            api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("開啟資料庫失敗: {error}"),
+            )
+        })?;
+
+        let class_exists: Option<i64> = conn
+            .query_row(
+                "SELECT id FROM classrooms WHERE id = ?1",
+                params![classroom_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| {
+                api_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("讀取班級失敗: {error}"),
+                )
+            })?;
+        if class_exists.is_none() {
+            return Err(api_error(StatusCode::NOT_FOUND, "指定班級不存在"));
+        }
+
+        let mut existing_ids = HashSet::new();
+        {
+            let mut stmt = conn
+                .prepare("SELECT id FROM students WHERE classroom_id = ?1")
+                .map_err(|error| {
+                    api_error(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("準備學生查詢失敗: {error}"),
+                    )
+                })?;
+            let rows = stmt
+                .query_map(params![classroom_id], |row| row.get::<_, i64>(0))
+                .map_err(|error| {
+                    api_error(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("查詢學生清單失敗: {error}"),
+                    )
+                })?;
+            for row in rows {
+                existing_ids.insert(row.map_err(|error| {
+                    api_error(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("讀取學生資料失敗: {error}"),
+                    )
+                })?);
+            }
+        }
+
+        let keep_ids = normalized
+            .iter()
+            .filter_map(|(id, _, _)| *id)
+            .collect::<HashSet<_>>();
+        for id in &keep_ids {
+            if !existing_ids.contains(id) {
+                return Err(api_error(StatusCode::NOT_FOUND, "指定學生不存在"));
+            }
+        }
+
+        {
+            let tx = conn.transaction().map_err(|error| {
+                api_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("建立交易失敗: {error}"),
+                )
+            })?;
+
+            for id in existing_ids.difference(&keep_ids) {
+                tx.execute(
+                    "DELETE FROM students WHERE id = ?1 AND classroom_id = ?2",
+                    params![id, classroom_id],
+                )
+                .map_err(|error| {
+                    api_error(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("刪除學生失敗: {error}"),
+                    )
+                })?;
+            }
+
+            for (id, seat_no_text, nickname) in &normalized {
+                let result = if let Some(student_id) = id {
+                    tx.execute(
+                        "UPDATE students
+                         SET seat_no_text = ?1,
+                             nickname = ?2
+                         WHERE id = ?3 AND classroom_id = ?4",
+                        params![seat_no_text, nickname, student_id, classroom_id],
+                    )
+                } else {
+                    tx.execute(
+                        "INSERT INTO students (classroom_id, seat_no_text, nickname) VALUES (?1, ?2, ?3)",
+                        params![classroom_id, seat_no_text, nickname],
+                    )
+                };
+
+                if let Err(error) = result {
+                    let message = error.to_string();
+                    if message.contains("UNIQUE") {
+                        return Err(api_error(StatusCode::CONFLICT, "座號不可重複"));
+                    }
+                    return Err(api_error(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("儲存學生資料失敗: {error}"),
+                    ));
+                }
+            }
+
+            tx.commit().map_err(|error| {
+                api_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("提交學生資料失敗: {error}"),
+                )
+            })?;
+        }
+
+        let mut active_students = HashMap::new();
+        {
+            let mut stmt = conn
+                .prepare("SELECT id, seat_no_text, nickname FROM students WHERE classroom_id = ?1")
+                .map_err(|error| {
+                    api_error(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("準備學生查詢失敗: {error}"),
+                    )
+                })?;
+            let rows = stmt
+                .query_map(params![classroom_id], |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                })
+                .map_err(|error| {
+                    api_error(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("查詢學生清單失敗: {error}"),
+                    )
+                })?;
+            for row in rows {
+                let (id, seat_no_text, nickname) = row.map_err(|error| {
+                    api_error(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("讀取學生資料失敗: {error}"),
+                    )
+                })?;
+                active_students.insert(id, (seat_no_text, nickname));
+            }
+        }
+
+        active_students
+    };
+
+    let mut stale_connections = Vec::new();
+    {
+        let mut guard = hub.lock().await;
+        for session in guard.students.values_mut() {
+            if session.classroom_id != classroom_id {
+                continue;
+            }
+
+            if let Some((seat_no_text, nickname)) = active_students.get(&session.student_id) {
+                session.seat_no_text = seat_no_text.clone();
+                session.nickname = seat_nickname_display(seat_no_text, nickname);
+            } else {
+                stale_connections.push(session.connection_id.clone());
+            }
+        }
+
+        for connection_id in &stale_connections {
+            if let Some(tx) = guard.student_channels.get(connection_id) {
+                send_json(
+                    tx,
+                    &SignalEnvelope {
+                        event: "force-logout".to_string(),
+                        source: None,
+                        target: Some(connection_id.clone()),
+                        nickname: None,
+                        payload: Some(json!({ "reason": "class-members-updated" })),
+                        message: Some("班級名單已更新，請重新選擇座號加入".to_string()),
+                    },
+                );
+            }
+        }
+
+        for connection_id in stale_connections {
+            guard.students.remove(&connection_id);
+            guard.student_channels.remove(&connection_id);
+        }
+    }
+
+    broadcast_student_list(&hub).await;
+    broadcast_classroom_state(&runtime).await;
+    let payload = build_classroom_state(&runtime)
+        .await
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error))?;
+    Ok(Json(payload))
+}
+
+async fn update_student_handler(
+    State(state): State<HttpState>,
+    Path((classroom_id, student_id)): Path<(i64, i64)>,
+    Json(body): Json<UpdateStudentRequest>,
+) -> Result<Json<ClassroomStatePayload>, (StatusCode, Json<Value>)> {
+    let seat_no_text = normalize_seat_no_text(&body.seat_no_text);
+    if seat_no_text.is_empty() {
+        return Err(api_error(StatusCode::BAD_REQUEST, "座號不可為空"));
+    }
+
+    let runtime = state.runtime.clone();
+    let db_path = {
+        let guard = runtime.lock().await;
+        guard.db_path.clone()
+    };
+    let conn = Connection::open(db_path).map_err(|error| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("開啟資料庫失敗: {error}"),
+        )
+    })?;
+
+    let duplicate: Option<i64> = conn
+        .query_row(
+            "SELECT id FROM students WHERE classroom_id = ?1 AND seat_no_text = ?2 AND id != ?3",
+            params![classroom_id, seat_no_text, student_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|error| {
+            api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("檢查座號重複失敗: {error}"),
+            )
+        })?;
+    if duplicate.is_some() {
+        return Err(api_error(StatusCode::CONFLICT, "座號不可重複"));
+    }
+
+    let updated = conn
+        .execute(
+            "UPDATE students
+             SET seat_no_text = ?1,
+                 nickname = ?2
+             WHERE id = ?3 AND classroom_id = ?4",
+            params![seat_no_text, body.nickname, student_id, classroom_id],
+        )
+        .map_err(|error| {
+            api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("更新學生資料失敗: {error}"),
+            )
+        })?;
+    if updated == 0 {
+        return Err(api_error(StatusCode::NOT_FOUND, "指定學生不存在"));
+    }
+
+    let hub = {
+        let guard = runtime.lock().await;
+        guard.hub.clone()
+    };
+    {
+        let mut guard = hub.lock().await;
+        for session in guard.students.values_mut() {
+            if session.student_id == student_id {
+                session.seat_no_text = seat_no_text.clone();
+                session.nickname = seat_nickname_display(&seat_no_text, &body.nickname);
+            }
+        }
+    }
+
+    broadcast_student_list(&hub).await;
+    broadcast_classroom_state(&runtime).await;
+    let payload = build_classroom_state(&runtime)
+        .await
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error))?;
+    Ok(Json(payload))
+}
+
+fn find_roster_student_for_join(
+    db_path: &PathBuf,
+    classroom_id: i64,
+    seat_no_text: &str,
+) -> Result<Option<(i64, String, String)>, String> {
+    let conn = Connection::open(db_path).map_err(|error| format!("開啟資料庫失敗: {error}"))?;
+    conn.query_row(
+        "SELECT id, seat_no_text, nickname
+         FROM students
+         WHERE classroom_id = ?1 AND seat_no_text = ?2",
+        params![classroom_id, seat_no_text],
+        |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        },
+    )
+    .optional()
+    .map_err(|error| format!("查詢學生名單失敗: {error}"))
 }
 
 async fn broadcast_student_list(hub: &Arc<Mutex<SessionHub>>) {
@@ -307,17 +1262,7 @@ async fn forward_signal(
         .filter(|target| !target.is_empty());
 
     let Some(target_id) = target_id else {
-        send_json(
-            sender,
-            &SignalEnvelope {
-                event: "error".to_string(),
-                source: None,
-                target: None,
-                nickname: None,
-                payload: None,
-                message: Some("找不到可用目標端".to_string()),
-            },
-        );
+        send_ws_error(sender, "找不到可用目標端");
         return;
     };
 
@@ -341,21 +1286,16 @@ async fn forward_signal(
             .unwrap_or(false);
 
     if !sent {
-        send_json(
-            sender,
-            &SignalEnvelope {
-                event: "error".to_string(),
-                source: None,
-                target: None,
-                nickname: None,
-                payload: None,
-                message: Some("訊號傳遞失敗，目標端可能已離線".to_string()),
-            },
-        );
+        send_ws_error(sender, "訊號傳遞失敗，目標端可能已離線");
     }
 }
 
-async fn handle_socket(socket: WebSocket, hub: Arc<Mutex<SessionHub>>, role: String) {
+async fn handle_socket(
+    socket: WebSocket,
+    runtime: Arc<Mutex<BackendRuntime>>,
+    hub: Arc<Mutex<SessionHub>>,
+    role: String,
+) {
     let (mut ws_writer, mut ws_reader) = socket.split();
     let (out_tx, mut out_rx) = mpsc::unbounded_channel::<String>();
 
@@ -389,6 +1329,20 @@ async fn handle_socket(socket: WebSocket, hub: Arc<Mutex<SessionHub>>, role: Str
                 message: None,
             },
         );
+        drop(guard);
+        if let Ok(state) = build_classroom_state(&runtime).await {
+            send_json(
+                &out_tx,
+                &SignalEnvelope {
+                    event: "classroom-state".to_string(),
+                    source: None,
+                    target: None,
+                    nickname: None,
+                    payload: Some(json!({ "state": state })),
+                    message: None,
+                },
+            );
+        }
     } else if is_console {
         let mut guard = hub.lock().await;
         guard
@@ -404,6 +1358,32 @@ async fn handle_socket(socket: WebSocket, hub: Arc<Mutex<SessionHub>>, role: Str
                 target: None,
                 nickname: None,
                 payload: Some(json!({ "students": students })),
+                message: None,
+            },
+        );
+        drop(guard);
+        if let Ok(state) = build_classroom_state(&runtime).await {
+            send_json(
+                &out_tx,
+                &SignalEnvelope {
+                    event: "classroom-state".to_string(),
+                    source: None,
+                    target: None,
+                    nickname: None,
+                    payload: Some(json!({ "state": state })),
+                    message: None,
+                },
+            );
+        }
+    } else if let Ok(state) = build_classroom_state(&runtime).await {
+        send_json(
+            &out_tx,
+            &SignalEnvelope {
+                event: "classroom-state".to_string(),
+                source: None,
+                target: None,
+                nickname: None,
+                payload: Some(json!({ "state": state })),
                 message: None,
             },
         );
@@ -427,49 +1407,68 @@ async fn handle_socket(socket: WebSocket, hub: Arc<Mutex<SessionHub>>, role: Str
         };
 
         let Ok(mut incoming) = serde_json::from_str::<SignalEnvelope>(&text) else {
-            send_json(
-                &out_tx,
-                &SignalEnvelope {
-                    event: "error".to_string(),
-                    source: None,
-                    target: None,
-                    nickname: None,
-                    payload: None,
-                    message: Some("訊息格式錯誤".to_string()),
-                },
-            );
+            send_ws_error(&out_tx, "訊息格式錯誤");
             continue;
         };
 
         match incoming.event.as_str() {
             "join" if !is_teacher && !is_console => {
-                let Some(nickname) = incoming.nickname.clone() else {
-                    send_json(
-                        &out_tx,
-                        &SignalEnvelope {
-                            event: "error".to_string(),
-                            source: None,
-                            target: None,
-                            nickname: None,
-                            payload: None,
-                            message: Some("暱稱不可為空".to_string()),
-                        },
-                    );
+                let Some(payload) = incoming.payload.clone() else {
+                    send_ws_error(&out_tx, "缺少班級與座號資訊");
                     continue;
                 };
 
-                if nickname.trim().is_empty() {
-                    send_json(
-                        &out_tx,
-                        &SignalEnvelope {
-                            event: "error".to_string(),
-                            source: None,
-                            target: None,
-                            nickname: None,
-                            payload: None,
-                            message: Some("請輸入有效暱稱".to_string()),
-                        },
-                    );
+                let join_payload = match serde_json::from_value::<JoinPayload>(payload) {
+                    Ok(payload) => payload,
+                    Err(_) => {
+                        send_ws_error(&out_tx, "加入資料格式錯誤");
+                        continue;
+                    }
+                };
+
+                let seat_no_text = normalize_seat_no_text(&join_payload.seat_no_text);
+                if seat_no_text.is_empty() {
+                    send_ws_error(&out_tx, "請選擇有效座號");
+                    continue;
+                }
+
+                let (db_path, current_classroom_id) = {
+                    let guard = runtime.lock().await;
+                    (guard.db_path.clone(), guard.current_classroom_id)
+                };
+
+                if join_payload.classroom_id != current_classroom_id {
+                    send_ws_error(&out_tx, "班級已變更，請重新選擇名單");
+                    continue;
+                }
+
+                let student_row = match find_roster_student_for_join(
+                    &db_path,
+                    current_classroom_id,
+                    &seat_no_text,
+                ) {
+                    Ok(Some(student_row)) => student_row,
+                    Ok(None) => {
+                        send_ws_error(&out_tx, "找不到對應學生名單項目");
+                        continue;
+                    }
+                    Err(error) => {
+                        send_ws_error(&out_tx, error);
+                        continue;
+                    }
+                };
+                let (student_row_id, student_seat_no_text, student_nickname) = student_row;
+                let display_name = seat_nickname_display(&student_seat_no_text, &student_nickname);
+
+                let seat_is_occupied = {
+                    let guard = hub.lock().await;
+                    guard.students.values().any(|student| {
+                        student.classroom_id == current_classroom_id
+                            && student.seat_no_text == student_seat_no_text
+                    })
+                };
+                if seat_is_occupied {
+                    send_ws_error(&out_tx, "該學生已連入，請選擇其他座號");
                     continue;
                 }
 
@@ -486,7 +1485,10 @@ async fn handle_socket(socket: WebSocket, hub: Arc<Mutex<SessionHub>>, role: Str
                         conn_id.clone(),
                         StudentSession {
                             connection_id: conn_id.clone(),
-                            nickname: nickname.clone(),
+                            student_id: student_row_id,
+                            classroom_id: current_classroom_id,
+                            seat_no_text: student_seat_no_text.clone(),
+                            nickname: display_name.clone(),
                             connected: true,
                             focus_status: "focused".to_string(),
                             focus_updated_at: 0,
@@ -501,13 +1503,14 @@ async fn handle_socket(socket: WebSocket, hub: Arc<Mutex<SessionHub>>, role: Str
                         event: "joined".to_string(),
                         source: Some(conn_id),
                         target: teacher_target,
-                        nickname: Some(nickname),
+                        nickname: Some(display_name),
                         payload: None,
                         message: None,
                     },
                 );
 
                 broadcast_student_list(&hub).await;
+                broadcast_classroom_state(&runtime).await;
             }
             "offer" | "answer" | "ice-candidate" => {
                 if is_console {
@@ -552,6 +1555,7 @@ async fn handle_socket(socket: WebSocket, hub: Arc<Mutex<SessionHub>>, role: Str
         guard.student_channels.remove(&id);
         drop(guard);
         broadcast_student_list(&hub).await;
+        broadcast_classroom_state(&runtime).await;
     }
 
     writer_task.abort();
@@ -585,11 +1589,46 @@ async fn start_server_impl(runtime: Arc<Mutex<BackendRuntime>>) -> Result<Server
 
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
     let root_assets = ServeDir::new(frontend_assets_root.join("assets"));
+    let local_ip_host = format_host_for_url(&resolve_local_ip());
+    let local_dev_origin = format!("http://{local_ip_host}:1420");
+    let mut allowed_origins: Vec<HeaderValue> = vec![
+        "http://localhost:1420"
+            .parse()
+            .expect("valid dev webview origin"),
+        "http://127.0.0.1:1420"
+            .parse()
+            .expect("valid dev webview origin"),
+    ];
+    if let Ok(origin) = local_dev_origin.parse::<HeaderValue>() {
+        allowed_origins.push(origin);
+    }
+    let cors_layer = CorsLayer::new()
+        .allow_origin(allowed_origins)
+        .allow_methods(Any)
+        .allow_headers(Any);
     let mut router = Router::new()
         .route("/", get(student_page))
         .route("/student", get(student_page))
         .route("/teacher", get(teacher_page))
         .route("/api/app/version", get(app_version))
+        .route("/api/classroom/state", get(get_classroom_state_handler))
+        .route(
+            "/api/classrooms",
+            get(list_classrooms_handler).post(create_classroom_handler),
+        )
+        .route("/api/classrooms/select", post(select_classroom_handler))
+        .route(
+            "/api/classrooms/{classroom_id}",
+            patch(update_classroom_handler).delete(delete_classroom_handler),
+        )
+        .route(
+            "/api/classrooms/{classroom_id}/students/{student_id}",
+            patch(update_student_handler),
+        )
+        .route(
+            "/api/classrooms/{classroom_id}/students/bulk-save",
+            post(save_class_members_handler),
+        )
         .route("/health", get(health))
         .route_service(
             "/song-class.png",
@@ -597,7 +1636,11 @@ async fn start_server_impl(runtime: Arc<Mutex<BackendRuntime>>) -> Result<Server
         )
         .route("/ws", get(ws_handler))
         .nest_service("/assets", root_assets)
-        .with_state(HttpState { hub });
+        .layer(cors_layer)
+        .with_state(HttpState {
+            runtime: runtime.clone(),
+            hub,
+        });
 
     if cfg!(debug_assertions) {
         router = router
@@ -696,9 +1739,9 @@ async fn get_server_debug_info(
             .collect(),
         executable_path,
         tauri_resource_dir,
-        app_teacher_url: format!("http://127.0.0.1:{DEFAULT_PORT}/teacher?base={base_url}"),
+        app_teacher_url: format!("http://localhost:{DEFAULT_PORT}/teacher?base={base_url}"),
         app_student_url: format!("{base_url}/student"),
-        teacher_redirect_url: format!("http://127.0.0.1:{DEFAULT_PORT}/teacher?base={base_url}"),
+        teacher_redirect_url: format!("http://localhost:{DEFAULT_PORT}/teacher?base={base_url}"),
         student_redirect_url: format!("{base_url}/student"),
     })
 }
@@ -817,10 +1860,23 @@ pub fn run() {
                 .map(|path| path.to_string_lossy().to_string());
             let frontend_assets_candidates = collect_frontend_assets_candidates(app.handle());
             let frontend_assets_root = resolve_frontend_assets_root(&frontend_assets_candidates);
+
+            let db_dir = app
+                .path()
+                .app_data_dir()
+                .ok()
+                .or_else(|| std::env::current_dir().ok().map(|path| path.join("data")))
+                .unwrap_or_else(|| PathBuf::from("./data"));
+            let db_path = db_dir.join("song-class.sqlite3");
+            let current_classroom_id = init_database(&db_path)
+                .map_err(|error| std::io::Error::new(std::io::ErrorKind::Other, error))?;
+
             app.manage(BackendState::new(
                 frontend_assets_root,
                 frontend_assets_candidates,
                 tauri_resource_dir,
+                db_path,
+                current_classroom_id,
             ));
             let runtime = app.state::<BackendState>().inner.clone();
             tauri::async_runtime::spawn(async move {
@@ -847,4 +1903,79 @@ pub fn run() {
         })
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_temp_db_path() -> PathBuf {
+        std::env::temp_dir().join(format!("song-class-test-{}.sqlite3", Uuid::new_v4()))
+    }
+
+    #[test]
+    fn init_database_creates_default_class_and_30_students() {
+        let db_path = make_temp_db_path();
+        let class_id = init_database(&db_path).expect("init database should succeed");
+        assert!(class_id > 0, "current classroom id should be positive");
+
+        let conn = Connection::open(&db_path).expect("open sqlite database");
+        let class_count: i64 = conn
+            .query_row("SELECT COUNT(1) FROM classrooms", [], |row| row.get(0))
+            .expect("query classroom count");
+        assert_eq!(
+            class_count, 1,
+            "should create exactly one default classroom"
+        );
+
+        let student_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(1) FROM students WHERE classroom_id = ?1",
+                params![class_id],
+                |row| row.get(0),
+            )
+            .expect("query student count");
+        assert_eq!(student_count, 30, "should create 30 default students");
+
+        let _ = fs::remove_file(db_path);
+    }
+
+    #[test]
+    fn init_database_is_idempotent_without_duplicate_seed_data() {
+        let db_path = make_temp_db_path();
+
+        let first_class_id = init_database(&db_path).expect("first init should succeed");
+        let second_class_id = init_database(&db_path).expect("second init should succeed");
+        assert_eq!(
+            first_class_id, second_class_id,
+            "current classroom id should stay stable"
+        );
+
+        let conn = Connection::open(&db_path).expect("open sqlite database");
+        let class_count: i64 = conn
+            .query_row("SELECT COUNT(1) FROM classrooms", [], |row| row.get(0))
+            .expect("query classroom count");
+        assert_eq!(class_count, 1, "should not create duplicate classrooms");
+
+        let duplicated_seat_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(1)
+                 FROM (
+                   SELECT seat_no_text
+                   FROM students
+                   WHERE classroom_id = ?1
+                   GROUP BY seat_no_text
+                   HAVING COUNT(1) > 1
+                 )",
+                params![first_class_id],
+                |row| row.get(0),
+            )
+            .expect("query duplicate seat count");
+        assert_eq!(
+            duplicated_seat_count, 0,
+            "seat numbers should remain unique"
+        );
+
+        let _ = fs::remove_file(db_path);
+    }
 }

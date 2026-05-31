@@ -52,6 +52,16 @@ song-class 是一個以「課堂即時互動」為核心的跨平台教學系統
 - `src-tauri/`：Tauri/Rust 程式碼與設定
 - `openspec/`：需求規格、變更提案、設計與任務文件
 
+## 資料庫儲存位置
+
+### Linux
+
+~/.local/share/boats.loren.song-class/song-class.sqlite3
+
+### windows
+
+...
+
 ## 快速開始
 
 ### 1. 安裝依賴

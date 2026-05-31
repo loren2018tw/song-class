@@ -9,10 +9,33 @@ export interface ServerInfo {
 
 export interface StudentSession {
   connection_id: string;
+  student_id?: number;
+  classroom_id?: number;
+  seat_no_text?: string;
   nickname: string;
   connected: boolean;
   focus_status?: StudentFocusStatus;
   focus_updated_at?: number;
+}
+
+export interface ClassroomSummary {
+  id: number;
+  name: string;
+}
+
+export interface ClassroomStudent {
+  id: number;
+  classroom_id: number;
+  seat_no_text: string;
+  nickname: string;
+  display_name: string;
+  occupied: boolean;
+}
+
+export interface ClassroomStatePayload {
+  current_classroom: ClassroomSummary;
+  classrooms: ClassroomSummary[];
+  students: ClassroomStudent[];
 }
 
 export type StudentFocusStatus = "focused" | "away";

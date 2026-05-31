@@ -14,6 +14,7 @@ import StudentListCard from "../components/StudentListCard.vue";
 import { useAppVersion } from "../composables/useAppVersion";
 import { createPeerConnection } from "../composables/usePeerConnection";
 import type {
+  ClassroomStatePayload,
   SignalEnvelope,
   StudentFocusStatus,
   StudentSession,
@@ -57,6 +58,7 @@ const props = defineProps<{
 const { appVersionLabel } = useAppVersion(props.baseUrl);
 
 const students = ref<StudentSession[]>([]);
+const currentClassroomName = ref("載入中");
 const wsStatus = ref("尚未連線");
 const rtcError = ref("");
 const rtcErrorVisible = ref(false);
@@ -87,7 +89,7 @@ const studentFocusStatusById = reactive(new Map<string, StudentFocusStatus>());
 const studentFocusUpdatedAtById = reactive(new Map<string, number>());
 const teacherBroadcastStarting = ref(false);
 const teacherBroadcastStream = ref<MediaStream | null>(null);
-const broadcastQualityPreset = ref<"balanced" | "low">("balanced");
+const broadcastQualityPreset = ref<"balanced">("balanced");
 
 const whiteboardBackgroundOptions = [
   { fileName: null, displayName: "空白" },
@@ -243,7 +245,6 @@ const teacherBroadcastCaptureSupportError = computed(() => {
 });
 const broadcastQualityOptions = [
   { value: "balanced", title: "720p / 15fps" },
-  { value: "low", title: "540p / 10fps" },
 ] as const;
 
 function toActiveModule(mode: WhiteboardMode): ActiveModule {
@@ -260,14 +261,6 @@ function toActiveModule(mode: WhiteboardMode): ActiveModule {
 }
 
 function toBroadcastCaptureConstraints() {
-  if (broadcastQualityPreset.value === "low") {
-    return {
-      width: { ideal: 960, max: 960 },
-      height: { ideal: 540, max: 540 },
-      frameRate: { ideal: 10, max: 10 },
-    };
-  }
-
   return {
     width: { ideal: 1280, max: 1280 },
     height: { ideal: 720, max: 720 },
@@ -340,14 +333,38 @@ const quickQaDetailsByOption = computed(() =>
     })),
   })),
 );
-const quickQaStudentStatuses = computed(() => {
-  const collator = new Intl.Collator("zh-Hant", {
-    numeric: true,
-    sensitivity: "base",
-  });
+const studentNameCollator = new Intl.Collator("zh-Hant", {
+  numeric: true,
+  sensitivity: "base",
+});
 
+function seatNicknameSortKey(student: StudentSession): string {
+  const seat = student.seat_no_text?.trim() ?? "";
+  const rawNickname = student.nickname ?? "";
+
+  if (!seat) {
+    return rawNickname.trim();
+  }
+
+  const nicknameWithoutSeat = rawNickname.startsWith(seat)
+    ? rawNickname.slice(seat.length).trim()
+    : rawNickname.trim();
+  return `${seat}${nicknameWithoutSeat}`;
+}
+
+const sortedStudentsForChipList = computed(() =>
+  [...students.value].sort((left, right) =>
+    studentNameCollator.compare(
+      seatNicknameSortKey(left),
+      seatNicknameSortKey(right),
+    ),
+  ),
+);
+const quickQaStudentStatuses = computed(() => {
   return [...students.value]
-    .sort((left, right) => collator.compare(left.nickname, right.nickname))
+    .sort((left, right) =>
+      studentNameCollator.compare(left.nickname, right.nickname),
+    )
     .map((student) => ({
       id: student.connection_id,
       nickname: student.nickname,
@@ -374,13 +391,10 @@ const quickQaLeaderboardTop10 = computed(() => {
 
 const teacherBackgroundImage = computed(() => teacherBackground.value);
 const studentBoardTiles = computed(() => {
-  const collator = new Intl.Collator("zh-Hant", {
-    numeric: true,
-    sensitivity: "base",
-  });
-
   return [...students.value]
-    .sort((left, right) => collator.compare(left.nickname, right.nickname))
+    .sort((left, right) =>
+      studentNameCollator.compare(left.nickname, right.nickname),
+    )
     .map((student) => ({
       id: student.connection_id,
       nickname: student.nickname,
@@ -1928,6 +1942,14 @@ function reconcileStudentConnections(nextStudents: StudentSession[]) {
 }
 
 async function handleSignal(message: SignalEnvelope) {
+  if (message.event === "classroom-state") {
+    const payload = message.payload as { state?: ClassroomStatePayload };
+    if (payload?.state) {
+      currentClassroomName.value = payload.state.current_classroom.name;
+    }
+    return;
+  }
+
   if (message.event === "students" || message.event === "teacher-ready") {
     const payload = message.payload as
       | { students?: StudentSession[] }
@@ -2107,6 +2129,11 @@ onBeforeUnmount(() => {
 <template>
   <v-app>
     <v-app-bar title="song-class(教師端)">
+      <template #prepend>
+        <div class="pl-3 text-caption text-medium-emphasis">
+          目前班級: {{ currentClassroomName }}
+        </div>
+      </template>
       <template #append>
         <div class="student-join-qr-wrap">
           <span class="student-join-qr-text">學生端連結</span>
@@ -2179,6 +2206,7 @@ onBeforeUnmount(() => {
           hide-details
           label="廣播畫質"
           variant="outlined"
+          disabled
         />
       </div>
       <v-alert
@@ -2273,7 +2301,7 @@ onBeforeUnmount(() => {
         <StudentListCard
           class="teacher-student-list-card"
           title="已連入學生"
-          :students="students"
+          :students="sortedStudentsForChipList"
         />
       </div>
     </v-navigation-drawer>

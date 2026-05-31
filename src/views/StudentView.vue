@@ -1,10 +1,15 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
-import NicknameJoinCard from "../components/NicknameJoinCard.vue";
+import RosterJoinCard from "../components/RosterJoinCard.vue";
 import WhiteboardCanvas from "../components/WhiteboardCanvas.vue";
 import { useAppVersion } from "../composables/useAppVersion";
 import { createPeerConnection } from "../composables/usePeerConnection";
-import type { SignalEnvelope, StudentFocusStatus } from "../types/session";
+import type {
+  ClassroomStatePayload,
+  ClassroomStudent,
+  SignalEnvelope,
+  StudentFocusStatus,
+} from "../types/session";
 import {
   QUICK_QA_OPTIONS,
   cloneWhiteboardSnapshot,
@@ -37,17 +42,11 @@ const { appVersionLabel } = useAppVersion(props.baseUrl);
 const STUDENT_BATCH_INTERVAL_MS = 33;
 const STUDENT_BATCH_MAX_EVENTS = 24;
 const STUDENT_FOCUS_STATUS_DEBOUNCE_MS = 250;
-const LAST_STUDENT_NICKNAME_STORAGE_KEY = "song-class:last-student-nickname";
-const LAST_STUDENT_NICKNAME_TTL_MS = 12 * 60 * 60 * 1000;
-
-type PersistedStudentNickname = {
-  nickname: string;
-  savedAt: number;
-};
 
 const statusText = ref("尚未連線");
 const isConnected = ref(false);
 const signalError = ref("");
+const classroomState = ref<ClassroomStatePayload | null>(null);
 const activeMode = ref<WhiteboardMode>("home");
 const activeTab = ref<WhiteboardBoardTab>("teacher-board");
 const isTeacherBoardViewForced = ref(false);
@@ -72,16 +71,17 @@ let studentBatchFlushTimer: number | null = null;
 let focusStatusDebounceTimer: number | null = null;
 let pendingFocusStatus: StudentFocusStatus | null = null;
 let lastSentFocusStatus: StudentFocusStatus | null = null;
+let classroomPollTimer: number | null = null;
 
 let ws: WebSocket | null = null;
 let peer: RTCPeerConnection | null = null;
 let lessonChannel: RTCDataChannel | null = null;
 let selfId: string | undefined;
 let teacherId: string | undefined;
-let pendingJoinNickname: string | null = null;
+let pendingJoinSelection: { classroomId: number; seatNoText: string } | null =
+  null;
 const queuedIceCandidates: RTCIceCandidateInit[] = [];
 const isJoinRequested = ref(false);
-const lastJoinedNickname = ref(readLastStudentNickname());
 
 const wsUrl = computed(() => {
   const base = new URL(props.baseUrl);
@@ -162,86 +162,6 @@ function optionBadgeColor(option: QuickQaOption): string {
   }
 }
 
-function isPersistedNicknameExpired(savedAt: number): boolean {
-  return Date.now() - savedAt > LAST_STUDENT_NICKNAME_TTL_MS;
-}
-
-function parsePersistedStudentNickname(
-  raw: string,
-): PersistedStudentNickname | null {
-  try {
-    const parsed = JSON.parse(raw) as Partial<PersistedStudentNickname>;
-    if (
-      typeof parsed.nickname !== "string" ||
-      typeof parsed.savedAt !== "number" ||
-      !Number.isFinite(parsed.savedAt)
-    ) {
-      return null;
-    }
-
-    return {
-      nickname: parsed.nickname,
-      savedAt: parsed.savedAt,
-    };
-  } catch {
-    return null;
-  }
-}
-
-function readLastStudentNickname(): string {
-  try {
-    const stored = localStorage.getItem(LAST_STUDENT_NICKNAME_STORAGE_KEY);
-    if (!stored) {
-      return "";
-    }
-
-    const parsed = parsePersistedStudentNickname(stored);
-    if (parsed) {
-      if (isPersistedNicknameExpired(parsed.savedAt)) {
-        localStorage.removeItem(LAST_STUDENT_NICKNAME_STORAGE_KEY);
-        return "";
-      }
-
-      return parsed.nickname;
-    }
-
-    // Backward compatibility: migrate legacy plain-string format.
-    const legacyNickname = stored.trim();
-    if (!legacyNickname) {
-      localStorage.removeItem(LAST_STUDENT_NICKNAME_STORAGE_KEY);
-      return "";
-    }
-
-    saveLastStudentNickname(legacyNickname);
-    return legacyNickname;
-  } catch {
-    return "";
-  }
-}
-
-function saveLastStudentNickname(nickname: string) {
-  try {
-    const payload: PersistedStudentNickname = {
-      nickname,
-      savedAt: Date.now(),
-    };
-    localStorage.setItem(
-      LAST_STUDENT_NICKNAME_STORAGE_KEY,
-      JSON.stringify(payload),
-    );
-  } catch {
-    // Ignore storage failures and continue with in-memory value.
-  }
-}
-
-function clearLastStudentNickname() {
-  try {
-    localStorage.removeItem(LAST_STUDENT_NICKNAME_STORAGE_KEY);
-  } catch {
-    // Ignore storage failures and continue with in-memory value.
-  }
-}
-
 function closeSignalSocket() {
   if (!ws) {
     return;
@@ -260,6 +180,39 @@ function closeSignalSocket() {
   }
 
   ws = null;
+}
+
+async function refreshClassroomStateFromApi() {
+  try {
+    const response = await fetch(
+      new URL("/api/classroom/state", props.baseUrl),
+    );
+    if (!response.ok) {
+      return;
+    }
+
+    const state = (await response.json()) as ClassroomStatePayload;
+    classroomState.value = state;
+  } catch {
+    // Ignore temporary fetch failures; websocket/error UI will provide feedback.
+  }
+}
+
+function stopClassroomPollTimer() {
+  if (classroomPollTimer !== null) {
+    window.clearInterval(classroomPollTimer);
+    classroomPollTimer = null;
+  }
+}
+
+function startClassroomPollTimer() {
+  stopClassroomPollTimer();
+  classroomPollTimer = window.setInterval(() => {
+    if (isConnected.value) {
+      return;
+    }
+    void refreshClassroomStateFromApi();
+  }, 3000);
 }
 
 function sendSignal(payload: SignalEnvelope) {
@@ -517,10 +470,16 @@ function ensureSocket() {
   ws.onopen = () => {
     statusText.value = "已連上訊號服務";
     signalError.value = "";
-    if (pendingJoinNickname) {
-      sendSignal({ event: "join", nickname: pendingJoinNickname });
+    if (pendingJoinSelection) {
+      sendSignal({
+        event: "join",
+        payload: {
+          classroom_id: pendingJoinSelection.classroomId,
+          seat_no_text: pendingJoinSelection.seatNoText,
+        },
+      });
       isJoinRequested.value = true;
-      pendingJoinNickname = null;
+      pendingJoinSelection = null;
     }
   };
 
@@ -539,6 +498,20 @@ function ensureSocket() {
 
       if (message.event === "error") {
         signalError.value = message.message ?? "發生未知錯誤";
+        return;
+      }
+
+      if (message.event === "classroom-state") {
+        const payload = message.payload as { state?: ClassroomStatePayload };
+        if (payload?.state) {
+          classroomState.value = payload.state;
+        }
+        return;
+      }
+
+      if (message.event === "force-logout") {
+        resetToJoinState(message.message ?? "班級已切換，請重新加入");
+        signalError.value = message.message ?? "班級已切換，請重新加入";
         return;
       }
 
@@ -930,57 +903,16 @@ function handleStudentSyncEvent(payload: WhiteboardIncrementalEventPayload) {
   enqueueStudentEvent(payload);
 }
 
-function attemptResumeReconnect(reason: string) {
-  if (isConnected.value || isJoinRequested.value) {
-    return;
-  }
-
-  if (document.visibilityState === "hidden") {
-    return;
-  }
-
-  const persistedNickname = readLastStudentNickname();
-  if (persistedNickname !== lastJoinedNickname.value) {
-    lastJoinedNickname.value = persistedNickname;
-  }
-
-  const nickname = persistedNickname.trim();
-  if (!nickname) {
-    return;
-  }
-
-  statusText.value = `偵測到裝置恢復(${reason})，正在自動重連...`;
-  handleJoin(nickname);
-}
-
 function handleVisibilityChange() {
   if (isConnected.value) {
     queueFocusStatus(resolveCurrentFocusStatus());
   }
-
-  if (document.visibilityState === "visible") {
-    attemptResumeReconnect("回到前景");
-  }
-}
-
-function handlePageShow() {
-  attemptResumeReconnect("頁面恢復");
-}
-
-function handleWindowFocus() {
-  attemptResumeReconnect("取得焦點");
-}
-
-function handleNetworkOnline() {
-  attemptResumeReconnect("網路恢復");
 }
 
 function leaveClassroom() {
-  pendingJoinNickname = null;
+  pendingJoinSelection = null;
   isJoinRequested.value = false;
   signalError.value = "";
-  lastJoinedNickname.value = "";
-  clearLastStudentNickname();
   closeSignalSocket();
   resetToJoinState("已離開教室");
 }
@@ -1032,21 +964,24 @@ async function startOffer() {
   });
 }
 
-function handleJoin(nickname: string) {
-  const trimmedNickname = nickname.trim();
-  if (!trimmedNickname) {
-    signalError.value = "請輸入有效暱稱";
+function handleJoin(student: ClassroomStudent) {
+  if (!classroomState.value) {
+    signalError.value = "班級資料尚未載入";
     return;
   }
 
-  lastJoinedNickname.value = trimmedNickname;
-  saveLastStudentNickname(trimmedNickname);
+  if (student.occupied) {
+    signalError.value = "該學生已連入，請選擇其他座號";
+    return;
+  }
 
   ensureSocket();
 
   if (
     isJoinRequested.value &&
-    pendingJoinNickname === trimmedNickname &&
+    pendingJoinSelection?.classroomId ===
+      classroomState.value.current_classroom.id &&
+    pendingJoinSelection?.seatNoText === student.seat_no_text &&
     ws &&
     ws.readyState < WebSocket.CLOSED
   ) {
@@ -1054,10 +989,19 @@ function handleJoin(nickname: string) {
   }
 
   if (ws && ws.readyState === WebSocket.OPEN) {
-    sendSignal({ event: "join", nickname: trimmedNickname });
+    sendSignal({
+      event: "join",
+      payload: {
+        classroom_id: classroomState.value.current_classroom.id,
+        seat_no_text: student.seat_no_text,
+      },
+    });
     isJoinRequested.value = true;
   } else {
-    pendingJoinNickname = trimmedNickname;
+    pendingJoinSelection = {
+      classroomId: classroomState.value.current_classroom.id,
+      seatNoText: student.seat_no_text,
+    };
     isJoinRequested.value = true;
     statusText.value = "連線建立中，準備送出加入請求...";
   }
@@ -1065,11 +1009,8 @@ function handleJoin(nickname: string) {
 
 onMounted(() => {
   document.addEventListener("visibilitychange", handleVisibilityChange);
-  window.addEventListener("pageshow", handlePageShow);
-  window.addEventListener("focus", handleWindowFocus);
-  window.addEventListener("online", handleNetworkOnline);
-
-  attemptResumeReconnect("頁面載入");
+  void refreshClassroomStateFromApi();
+  startClassroomPollTimer();
 });
 
 watch([teacherBroadcastVideoRef, teacherBroadcastStream], () => {
@@ -1092,9 +1033,7 @@ watch([teacherBroadcastVideoRef, teacherBroadcastStream], () => {
 
 onBeforeUnmount(() => {
   document.removeEventListener("visibilitychange", handleVisibilityChange);
-  window.removeEventListener("pageshow", handlePageShow);
-  window.removeEventListener("focus", handleWindowFocus);
-  window.removeEventListener("online", handleNetworkOnline);
+  stopClassroomPollTimer();
 
   stopStudentBatchTimer();
   stopFocusStatusDebounceTimer();
@@ -1132,9 +1071,11 @@ onBeforeUnmount(() => {
       <v-container v-if="!isConnected || activeMode === 'home'" class="py-8">
         <v-row justify="center">
           <v-col cols="12" md="8" lg="7">
-            <NicknameJoinCard
+            <RosterJoinCard
               v-if="!isConnected"
-              :initial-nickname="lastJoinedNickname"
+              :classroom="classroomState?.current_classroom ?? null"
+              :students="classroomState?.students ?? []"
+              :loading="isJoinRequested"
               @submit="handleJoin"
             />
 
