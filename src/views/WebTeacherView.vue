@@ -13,7 +13,11 @@ import WhiteboardCanvas from "../components/WhiteboardCanvas.vue";
 import StudentListCard from "../components/StudentListCard.vue";
 import { useAppVersion } from "../composables/useAppVersion";
 import { createPeerConnection } from "../composables/usePeerConnection";
-import type { SignalEnvelope, StudentSession } from "../types/session";
+import type {
+  SignalEnvelope,
+  StudentFocusStatus,
+  StudentSession,
+} from "../types/session";
 import {
   QUICK_QA_OPTIONS,
   WHITEBOARD_CANVAS_HEIGHT,
@@ -43,6 +47,7 @@ import {
   type WhiteboardTeacherStudentEventBatchMessage,
   type WhiteboardStudentViewControlMessage,
   type WhiteboardSyncMessage,
+  type StudentFocusStatusMessage,
 } from "../types/whiteboard";
 
 const props = defineProps<{
@@ -78,6 +83,8 @@ const quickQaResultView = ref<"summary" | "details">("summary");
 const quickQaCloseDialogVisible = ref(false);
 const quickQaStageCorrectCounts = reactive(new Map<string, number>());
 const knownStudentNames = reactive(new Map<string, string>());
+const studentFocusStatusById = reactive(new Map<string, StudentFocusStatus>());
+const studentFocusUpdatedAtById = reactive(new Map<string, number>());
 const teacherBroadcastStarting = ref(false);
 const teacherBroadcastStream = ref<MediaStream | null>(null);
 const broadcastQualityPreset = ref<"balanced" | "low">("balanced");
@@ -135,6 +142,69 @@ let countdownAudioContext: AudioContext | null = null;
 
 const BATCH_INTERVAL_MS = 33;
 const BATCH_MAX_EVENTS = 24;
+
+function isStudentFocusStatus(value: unknown): value is StudentFocusStatus {
+  return value === "focused" || value === "away";
+}
+
+function normalizeStudentFocusStatus(value: unknown): StudentFocusStatus {
+  return isStudentFocusStatus(value) ? value : "focused";
+}
+
+function normalizeStudentFocusUpdatedAt(value: unknown, fallback = 0): number {
+  if (typeof value === "number" && Number.isFinite(value) && value > 0) {
+    return value;
+  }
+
+  return fallback;
+}
+
+function mergeStudentsWithFocus(
+  nextStudents: StudentSession[],
+): StudentSession[] {
+  return nextStudents.map((student) => {
+    const previousStatus = studentFocusStatusById.get(student.connection_id);
+    const previousUpdatedAt =
+      studentFocusUpdatedAtById.get(student.connection_id) ?? 0;
+    const focusStatus = normalizeStudentFocusStatus(
+      student.focus_status ?? previousStatus,
+    );
+    const focusUpdatedAt = normalizeStudentFocusUpdatedAt(
+      student.focus_updated_at,
+      previousUpdatedAt,
+    );
+
+    studentFocusStatusById.set(student.connection_id, focusStatus);
+    studentFocusUpdatedAtById.set(student.connection_id, focusUpdatedAt);
+
+    return {
+      ...student,
+      focus_status: focusStatus,
+      focus_updated_at: focusUpdatedAt,
+    };
+  });
+}
+
+function applyStudentFocusStatus(
+  studentId: string,
+  status: StudentFocusStatus,
+  updatedAt: number,
+) {
+  studentFocusStatusById.set(studentId, status);
+  studentFocusUpdatedAtById.set(studentId, updatedAt);
+
+  students.value = students.value.map((student) => {
+    if (student.connection_id !== studentId) {
+      return student;
+    }
+
+    return {
+      ...student,
+      focus_status: status,
+      focus_updated_at: updatedAt,
+    };
+  });
+}
 
 const wsUrl = computed(() => {
   const base = new URL(props.baseUrl);
@@ -1638,6 +1708,17 @@ function handleChannelMessage(studentId: string, raw: string) {
       return;
     }
 
+    if (parsed.kind === "student-focus-status") {
+      const message = parsed as StudentFocusStatusMessage;
+      const status = normalizeStudentFocusStatus(message.status);
+      const updatedAt = normalizeStudentFocusUpdatedAt(
+        message.updatedAt,
+        Date.now(),
+      );
+      applyStudentFocusStatus(studentId, status, updatedAt);
+      return;
+    }
+
     if (parsed.kind === "quick-qa-answer-submit") {
       if (!quickQaQuestion.value || quickQaQuestion.value.status !== "open") {
         return;
@@ -1797,6 +1878,8 @@ function disposeStudentConnection(studentId: string) {
 
   pendingCandidates.delete(studentId);
   teacherBroadcastSenders.delete(studentId);
+  studentFocusStatusById.delete(studentId);
+  studentFocusUpdatedAtById.delete(studentId);
   studentBoardSnapshots.delete(studentId);
   studentBoardLastSequence.delete(studentId);
   teacherToStudentLastSequence.delete(studentId);
@@ -1817,6 +1900,14 @@ function reconcileStudentConnections(nextStudents: StudentSession[]) {
   const activeIds = new Set(
     nextStudents.map((student) => student.connection_id),
   );
+
+  for (const studentId of studentFocusStatusById.keys()) {
+    if (!activeIds.has(studentId)) {
+      studentFocusStatusById.delete(studentId);
+      studentFocusUpdatedAtById.delete(studentId);
+    }
+  }
+
   for (const studentId of peers.keys()) {
     if (!activeIds.has(studentId)) {
       disposeStudentConnection(studentId);
@@ -1842,8 +1933,9 @@ async function handleSignal(message: SignalEnvelope) {
       | { students?: StudentSession[] }
       | undefined;
     const nextStudents = payload?.students ?? [];
-    students.value = nextStudents;
-    reconcileStudentConnections(nextStudents);
+    const mergedStudents = mergeStudentsWithFocus(nextStudents);
+    students.value = mergedStudents;
+    reconcileStudentConnections(mergedStudents);
     return;
   }
 

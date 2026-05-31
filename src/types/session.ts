@@ -11,7 +11,11 @@ export interface StudentSession {
   connection_id: string;
   nickname: string;
   connected: boolean;
+  focus_status?: StudentFocusStatus;
+  focus_updated_at?: number;
 }
+
+export type StudentFocusStatus = "focused" | "away";
 
 export interface SignalEnvelope {
   event: string;

@@ -86,6 +86,8 @@ struct StudentSession {
     connection_id: String,
     nickname: String,
     connected: bool,
+    focus_status: String,
+    focus_updated_at: u64,
 }
 
 #[derive(Debug, Default)]
@@ -486,6 +488,8 @@ async fn handle_socket(socket: WebSocket, hub: Arc<Mutex<SessionHub>>, role: Str
                             connection_id: conn_id.clone(),
                             nickname: nickname.clone(),
                             connected: true,
+                            focus_status: "focused".to_string(),
+                            focus_updated_at: 0,
                         },
                     );
                     guard.teacher_channels.keys().next().cloned()

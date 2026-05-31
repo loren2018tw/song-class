@@ -4,7 +4,7 @@ import NicknameJoinCard from "../components/NicknameJoinCard.vue";
 import WhiteboardCanvas from "../components/WhiteboardCanvas.vue";
 import { useAppVersion } from "../composables/useAppVersion";
 import { createPeerConnection } from "../composables/usePeerConnection";
-import type { SignalEnvelope } from "../types/session";
+import type { SignalEnvelope, StudentFocusStatus } from "../types/session";
 import {
   QUICK_QA_OPTIONS,
   cloneWhiteboardSnapshot,
@@ -21,6 +21,7 @@ import {
   type ActiveModule,
   type WhiteboardSnapshot,
   type WhiteboardSnapshotRequestMessage,
+  type StudentFocusStatusMessage,
   type WhiteboardStudentEventBatchMessage,
   type WhiteboardTeacherStudentEventBatchMessage,
   type WhiteboardSyncMessage,
@@ -35,6 +36,7 @@ const { appVersionLabel } = useAppVersion(props.baseUrl);
 
 const STUDENT_BATCH_INTERVAL_MS = 33;
 const STUDENT_BATCH_MAX_EVENTS = 24;
+const STUDENT_FOCUS_STATUS_DEBOUNCE_MS = 250;
 const LAST_STUDENT_NICKNAME_STORAGE_KEY = "song-class:last-student-nickname";
 const LAST_STUDENT_NICKNAME_TTL_MS = 12 * 60 * 60 * 1000;
 
@@ -67,6 +69,9 @@ let studentNextSequence = 1;
 const teacherStudentLastAppliedSequence = ref(0);
 const queuedStudentEvents: WhiteboardIncrementalEvent[] = [];
 let studentBatchFlushTimer: number | null = null;
+let focusStatusDebounceTimer: number | null = null;
+let pendingFocusStatus: StudentFocusStatus | null = null;
+let lastSentFocusStatus: StudentFocusStatus | null = null;
 
 let ws: WebSocket | null = null;
 let peer: RTCPeerConnection | null = null;
@@ -270,6 +275,66 @@ function sendLessonMessage(message: WhiteboardSyncMessage) {
   lessonChannel.send(JSON.stringify(message));
 }
 
+function stopFocusStatusDebounceTimer() {
+  if (focusStatusDebounceTimer !== null) {
+    window.clearTimeout(focusStatusDebounceTimer);
+    focusStatusDebounceTimer = null;
+  }
+}
+
+function resolveCurrentFocusStatus(): StudentFocusStatus {
+  return document.visibilityState === "visible" ? "focused" : "away";
+}
+
+function sendFocusStatusNow(status: StudentFocusStatus) {
+  if (!isConnected.value) {
+    return;
+  }
+
+  const message: StudentFocusStatusMessage = {
+    kind: "student-focus-status",
+    studentId: selfId,
+    status,
+    updatedAt: Date.now(),
+  };
+
+  sendLessonMessage(message);
+  lastSentFocusStatus = status;
+}
+
+function queueFocusStatus(status: StudentFocusStatus, force = false) {
+  if (!isConnected.value) {
+    return;
+  }
+
+  if (!force && status === lastSentFocusStatus) {
+    return;
+  }
+
+  pendingFocusStatus = status;
+
+  if (force) {
+    stopFocusStatusDebounceTimer();
+    const next = pendingFocusStatus;
+    pendingFocusStatus = null;
+    if (next) {
+      sendFocusStatusNow(next);
+    }
+    return;
+  }
+
+  stopFocusStatusDebounceTimer();
+  focusStatusDebounceTimer = window.setTimeout(() => {
+    focusStatusDebounceTimer = null;
+    const next = pendingFocusStatus;
+    pendingFocusStatus = null;
+    if (!next) {
+      return;
+    }
+    sendFocusStatusNow(next);
+  }, STUDENT_FOCUS_STATUS_DEBOUNCE_MS);
+}
+
 function requestTeacherSnapshot(
   reason: WhiteboardSnapshotRequestMessage["reason"],
 ) {
@@ -384,6 +449,9 @@ function resetToJoinState(message = "連線已中斷，請重新加入") {
   teacherStudentLastAppliedSequence.value = 0;
   queuedStudentEvents.length = 0;
   stopStudentBatchTimer();
+  stopFocusStatusDebounceTimer();
+  pendingFocusStatus = null;
+  lastSentFocusStatus = null;
   queuedIceCandidates.length = 0;
 
   if (lessonChannel) {
@@ -838,6 +906,7 @@ function bindLessonChannel(channel: RTCDataChannel) {
     statusText.value = "已連線，請專心學習";
     signalError.value = "";
     requestTeacherSnapshot("join-init");
+    queueFocusStatus(resolveCurrentFocusStatus(), true);
   };
 
   lessonChannel.onmessage = (event) => {
@@ -885,6 +954,10 @@ function attemptResumeReconnect(reason: string) {
 }
 
 function handleVisibilityChange() {
+  if (isConnected.value) {
+    queueFocusStatus(resolveCurrentFocusStatus());
+  }
+
   if (document.visibilityState === "visible") {
     attemptResumeReconnect("回到前景");
   }
@@ -1024,6 +1097,7 @@ onBeforeUnmount(() => {
   window.removeEventListener("online", handleNetworkOnline);
 
   stopStudentBatchTimer();
+  stopFocusStatusDebounceTimer();
   closeSignalSocket();
   if (lessonChannel) {
     lessonChannel.close();

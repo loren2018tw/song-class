@@ -5,6 +5,22 @@ defineProps<{
   title: string;
   students: StudentSession[];
 }>();
+
+function normalizeFocusStatus(student: StudentSession): "focused" | "away" {
+  return student.focus_status === "away" ? "away" : "focused";
+}
+
+function nicknameChipColor(student: StudentSession): string {
+  if (!student.connected) {
+    return "grey-darken-1";
+  }
+
+  return normalizeFocusStatus(student) === "away" ? "warning" : "success";
+}
+
+function nicknameChipLabel(student: StudentSession): string {
+  return student.nickname || "（未提供暱稱）";
+}
 </script>
 
 <template>
@@ -16,23 +32,31 @@ defineProps<{
       >
     </v-card-title>
     <v-card-text>
-      <v-list v-if="students.length > 0" density="comfortable" lines="one">
-        <v-list-item
+      <div v-if="students.length > 0" class="student-chip-grid">
+        <v-chip
           v-for="student in students"
           :key="student.connection_id"
-          rounded="lg"
+          :color="nicknameChipColor(student)"
+          size="small"
+          variant="flat"
+          class="student-chip-item"
         >
-          <v-list-item-title class="font-weight-medium">
-            {{ student.nickname || "（未提供暱稱）" }}
-          </v-list-item-title>
-          <template #append>
-            <v-chip color="success" size="x-small" variant="flat"
-              >連線中</v-chip
-            >
-          </template>
-        </v-list-item>
-      </v-list>
+          {{ nicknameChipLabel(student) }}
+        </v-chip>
+      </div>
       <v-alert v-else type="info" variant="tonal">尚無學生連入</v-alert>
     </v-card-text>
   </v-card>
 </template>
+
+<style scoped>
+.student-chip-grid {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.student-chip-item {
+  max-width: 100%;
+}
+</style>

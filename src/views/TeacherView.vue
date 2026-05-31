@@ -112,7 +112,11 @@ function handleSignal(message: SignalEnvelope) {
     const payload = message.payload as
       | { students?: StudentSession[] }
       | undefined;
-    students.value = payload?.students ?? [];
+    students.value = (payload?.students ?? []).map((student) => ({
+      ...student,
+      focus_status: student.focus_status ?? "focused",
+      focus_updated_at: student.focus_updated_at ?? 0,
+    }));
   }
 }
 

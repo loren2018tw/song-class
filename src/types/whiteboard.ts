@@ -221,6 +221,13 @@ export interface WhiteboardStudentOpenUrlMessage {
   url: string;
 }
 
+export interface StudentFocusStatusMessage {
+  kind: "student-focus-status";
+  studentId?: string;
+  status: "focused" | "away";
+  updatedAt: number;
+}
+
 export type WhiteboardSyncMessage =
   | WhiteboardModeSyncMessage
   | WhiteboardSnapshotSyncMessage
@@ -234,6 +241,7 @@ export type WhiteboardSyncMessage =
   | WhiteboardStudentBoardControlMessage
   | WhiteboardStudentViewControlMessage
   | WhiteboardStudentOpenUrlMessage
+  | StudentFocusStatusMessage
   | QuickQaStateMessage
   | QuickQaAnswerSubmitMessage;
 
@@ -314,6 +322,7 @@ export function isWhiteboardSyncMessage(
     kind === "student-board-control" ||
     kind === "student-view-control" ||
     kind === "student-open-url" ||
+    kind === "student-focus-status" ||
     kind === "quick-qa-state" ||
     kind === "quick-qa-answer-submit"
   );
