@@ -51,6 +51,7 @@ export interface SignalEnvelope {
 
 export type ActiveModule =
   | "home"
+  | "contact_book_management"
   | "whiteboard"
   | "quick_qa"
   | "teacher_screen_broadcast";

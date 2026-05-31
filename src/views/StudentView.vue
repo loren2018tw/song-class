@@ -140,6 +140,8 @@ function fromActiveModule(activeModule: ActiveModule): WhiteboardMode {
   switch (activeModule) {
     case "home":
       return "home";
+    case "contact_book_management":
+      return "home";
     case "whiteboard":
       return "whiteboard";
     case "quick_qa":

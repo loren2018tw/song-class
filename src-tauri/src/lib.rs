@@ -8,7 +8,7 @@ use axum::routing::{get, patch, post};
 use axum::{Json, Router};
 use futures_util::{SinkExt, StreamExt};
 use local_ip_address::local_ip;
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, params_from_iter, types::Value as SqlValue, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
@@ -239,6 +239,84 @@ struct SaveClassMemberItem {
     id: Option<i64>,
     seat_no_text: String,
     nickname: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ContactBookTask {
+    id: i64,
+    classroom_id: i64,
+    task_date: String,
+    title: String,
+    show_in_contact_book: bool,
+    requires_tracking: bool,
+    is_completed: bool,
+    student_count: i64,
+    submitted_count: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct TaskSubmissionStatus {
+    student_id: i64,
+    classroom_id: i64,
+    seat_no_text: String,
+    nickname: String,
+    display_name: String,
+    submitted: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct TaskSubmissionsPayload {
+    task: ContactBookTask,
+    submissions: Vec<TaskSubmissionStatus>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum TaskTab {
+    ContactBook,
+    Submission,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum TaskCompletionFilter {
+    All,
+    Unfinished,
+    Completed,
+}
+
+#[derive(Debug, Deserialize)]
+struct ListTasksQuery {
+    date: Option<String>,
+    tab: Option<TaskTab>,
+    completion: Option<TaskCompletionFilter>,
+    show_all_unfinished: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CreateTaskRequest {
+    task_date: String,
+    title: String,
+    show_in_contact_book: bool,
+    requires_tracking: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct UpdateTaskRequest {
+    task_date: String,
+    title: String,
+    show_in_contact_book: bool,
+    requires_tracking: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct UpdateTaskSubmissionRequest {
+    submitted: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct SetTaskCompletionRequest {
+    completed: bool,
 }
 
 #[derive(Deserialize)]
@@ -472,6 +550,291 @@ fn load_students_by_classroom(
     Ok(students)
 }
 
+fn to_db_bool(value: bool) -> i64 {
+    if value {
+        1
+    } else {
+        0
+    }
+}
+
+fn from_db_bool(value: i64) -> bool {
+    value != 0
+}
+
+fn normalize_task_date(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.len() != 10 {
+        return None;
+    }
+
+    let bytes = trimmed.as_bytes();
+    if bytes[4] != b'-' || bytes[7] != b'-' {
+        return None;
+    }
+
+    let year_ok = bytes[0..4].iter().all(|b| b.is_ascii_digit());
+    let month_ok = bytes[5..7].iter().all(|b| b.is_ascii_digit());
+    let day_ok = bytes[8..10].iter().all(|b| b.is_ascii_digit());
+    if !year_ok || !month_ok || !day_ok {
+        return None;
+    }
+
+    Some(trimmed.to_string())
+}
+
+fn validate_task_flags(show_in_contact_book: bool, requires_tracking: bool) -> Result<(), String> {
+    if !show_in_contact_book && !requires_tracking {
+        return Err("至少要勾選顯示在聯絡簿或需控管其中一項".to_string());
+    }
+    Ok(())
+}
+
+fn load_task_for_classroom(
+    conn: &Connection,
+    classroom_id: i64,
+    task_id: i64,
+) -> Result<Option<ContactBookTask>, String> {
+    conn.query_row(
+        "SELECT t.id,
+                t.classroom_id,
+                t.task_date,
+                t.title,
+                t.show_in_contact_book,
+                t.requires_tracking,
+                t.is_completed,
+                (SELECT COUNT(1)
+                   FROM students s
+                  WHERE s.classroom_id = t.classroom_id) AS student_count,
+                (SELECT COUNT(1)
+                   FROM task_submissions ts
+                   JOIN students s ON s.id = ts.student_id
+                  WHERE ts.task_id = t.id
+                    AND ts.submitted = 1
+                    AND s.classroom_id = t.classroom_id) AS submitted_count
+           FROM tasks t
+          WHERE t.id = ?1 AND t.classroom_id = ?2",
+        params![task_id, classroom_id],
+        |row| {
+            Ok(ContactBookTask {
+                id: row.get(0)?,
+                classroom_id: row.get(1)?,
+                task_date: row.get(2)?,
+                title: row.get(3)?,
+                show_in_contact_book: from_db_bool(row.get::<_, i64>(4)?),
+                requires_tracking: from_db_bool(row.get::<_, i64>(5)?),
+                is_completed: from_db_bool(row.get::<_, i64>(6)?),
+                student_count: row.get(7)?,
+                submitted_count: row.get(8)?,
+            })
+        },
+    )
+    .optional()
+    .map_err(|error| format!("讀取任務資料失敗: {error}"))
+}
+
+fn list_tasks_for_classroom(
+    conn: &Connection,
+    classroom_id: i64,
+    query: &ListTasksQuery,
+) -> Result<Vec<ContactBookTask>, String> {
+    let mut sql = String::from(
+        "SELECT t.id,
+                t.classroom_id,
+                t.task_date,
+                t.title,
+                t.show_in_contact_book,
+                t.requires_tracking,
+                t.is_completed,
+                (SELECT COUNT(1)
+                   FROM students s
+                  WHERE s.classroom_id = t.classroom_id) AS student_count,
+                (SELECT COUNT(1)
+                   FROM task_submissions ts
+                   JOIN students s ON s.id = ts.student_id
+                  WHERE ts.task_id = t.id
+                    AND ts.submitted = 1
+                    AND s.classroom_id = t.classroom_id) AS submitted_count
+           FROM tasks t
+          WHERE t.classroom_id = ?",
+    );
+    let mut bind_values = vec![SqlValue::Integer(classroom_id)];
+
+    match query.tab.unwrap_or(TaskTab::ContactBook) {
+        TaskTab::ContactBook => {
+            sql.push_str(" AND t.show_in_contact_book = 1");
+        }
+        TaskTab::Submission => {
+            sql.push_str(" AND t.requires_tracking = 1");
+        }
+    }
+
+    if query.show_all_unfinished.unwrap_or(false) {
+        sql.push_str(" AND t.is_completed = 0");
+    } else {
+        if let Some(date) = query.date.as_ref().and_then(|raw| normalize_task_date(raw)) {
+            sql.push_str(" AND t.task_date = ?");
+            bind_values.push(SqlValue::Text(date));
+        }
+
+        match query.completion.unwrap_or(TaskCompletionFilter::All) {
+            TaskCompletionFilter::All => {}
+            TaskCompletionFilter::Unfinished => sql.push_str(" AND t.is_completed = 0"),
+            TaskCompletionFilter::Completed => sql.push_str(" AND t.is_completed = 1"),
+        }
+    }
+
+    sql.push_str(" ORDER BY t.task_date ASC, t.id ASC");
+
+    let mut statement = conn
+        .prepare(&sql)
+        .map_err(|error| format!("準備任務查詢失敗: {error}"))?;
+    let rows = statement
+        .query_map(params_from_iter(bind_values), |row| {
+            Ok(ContactBookTask {
+                id: row.get(0)?,
+                classroom_id: row.get(1)?,
+                task_date: row.get(2)?,
+                title: row.get(3)?,
+                show_in_contact_book: from_db_bool(row.get::<_, i64>(4)?),
+                requires_tracking: from_db_bool(row.get::<_, i64>(5)?),
+                is_completed: from_db_bool(row.get::<_, i64>(6)?),
+                student_count: row.get(7)?,
+                submitted_count: row.get(8)?,
+            })
+        })
+        .map_err(|error| format!("查詢任務清單失敗: {error}"))?;
+
+    let mut tasks = Vec::new();
+    for row in rows {
+        tasks.push(row.map_err(|error| format!("讀取任務資料失敗: {error}"))?);
+    }
+    Ok(tasks)
+}
+
+fn load_task_submission_statuses(
+    conn: &Connection,
+    classroom_id: i64,
+    task_id: i64,
+) -> Result<Vec<TaskSubmissionStatus>, String> {
+    let mut statement = conn
+        .prepare(
+            "SELECT s.id,
+                    s.classroom_id,
+                    s.seat_no_text,
+                    s.nickname,
+                    COALESCE(ts.submitted, 0)
+               FROM students s
+               LEFT JOIN task_submissions ts
+                 ON ts.student_id = s.id
+                AND ts.task_id = ?2
+              WHERE s.classroom_id = ?1
+              ORDER BY s.seat_no_text ASC",
+        )
+        .map_err(|error| format!("準備繳交狀態查詢失敗: {error}"))?;
+
+    let rows = statement
+        .query_map(params![classroom_id, task_id], |row| {
+            let seat_no_text: String = row.get(2)?;
+            let nickname: String = row.get(3)?;
+            Ok(TaskSubmissionStatus {
+                student_id: row.get(0)?,
+                classroom_id: row.get(1)?,
+                display_name: seat_nickname_display(&seat_no_text, &nickname),
+                seat_no_text,
+                nickname,
+                submitted: from_db_bool(row.get::<_, i64>(4)?),
+            })
+        })
+        .map_err(|error| format!("查詢繳交狀態失敗: {error}"))?;
+
+    let mut statuses = Vec::new();
+    for row in rows {
+        statuses.push(row.map_err(|error| format!("讀取繳交狀態失敗: {error}"))?);
+    }
+    Ok(statuses)
+}
+
+fn sync_task_completion_from_submissions(
+    conn: &Connection,
+    classroom_id: i64,
+    task_id: i64,
+) -> Result<bool, String> {
+    let student_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(1) FROM students WHERE classroom_id = ?1",
+            params![classroom_id],
+            |row| row.get(0),
+        )
+        .map_err(|error| format!("讀取學生數量失敗: {error}"))?;
+
+    let submitted_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(1)
+               FROM task_submissions ts
+               JOIN students s ON s.id = ts.student_id
+              WHERE ts.task_id = ?1
+                AND ts.submitted = 1
+                AND s.classroom_id = ?2",
+            params![task_id, classroom_id],
+            |row| row.get(0),
+        )
+        .map_err(|error| format!("讀取繳交數量失敗: {error}"))?;
+
+    let all_submitted = student_count > 0 && submitted_count == student_count;
+    conn.execute(
+        "UPDATE tasks
+            SET is_completed = ?1
+          WHERE id = ?2
+            AND classroom_id = ?3",
+        params![to_db_bool(all_submitted), task_id, classroom_id],
+    )
+    .map_err(|error| format!("同步任務完成狀態失敗: {error}"))?;
+
+    Ok(all_submitted)
+}
+
+fn set_all_task_submission_states(
+    conn: &Connection,
+    classroom_id: i64,
+    task_id: i64,
+    submitted: bool,
+) -> Result<(), String> {
+    let mut students_stmt = conn
+        .prepare("SELECT id FROM students WHERE classroom_id = ?1")
+        .map_err(|error| format!("準備學生清單查詢失敗: {error}"))?;
+
+    let student_rows = students_stmt
+        .query_map(params![classroom_id], |row| row.get::<_, i64>(0))
+        .map_err(|error| format!("查詢學生清單失敗: {error}"))?;
+
+    let mut student_ids = Vec::new();
+    for row in student_rows {
+        student_ids.push(row.map_err(|error| format!("讀取學生資料失敗: {error}"))?);
+    }
+
+    for student_id in student_ids {
+        conn.execute(
+            "INSERT INTO task_submissions (task_id, student_id, submitted)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(task_id, student_id)
+             DO UPDATE SET submitted = excluded.submitted",
+            params![task_id, student_id, to_db_bool(submitted)],
+        )
+        .map_err(|error| format!("更新繳交狀態失敗: {error}"))?;
+    }
+
+    conn.execute(
+        "UPDATE tasks
+            SET is_completed = ?1
+          WHERE id = ?2 AND classroom_id = ?3",
+        params![to_db_bool(submitted), task_id, classroom_id],
+    )
+    .map_err(|error| format!("更新任務完成狀態失敗: {error}"))?;
+
+    Ok(())
+}
+
 async fn build_classroom_state(
     runtime: &Arc<Mutex<BackendRuntime>>,
 ) -> Result<ClassroomStatePayload, String> {
@@ -588,6 +951,341 @@ async fn list_classrooms_handler(
         "classrooms": payload.classrooms,
         "current_classroom_id": payload.current_classroom.id
     })))
+}
+
+async fn list_contact_book_tasks_handler(
+    State(state): State<HttpState>,
+    Query(query): Query<ListTasksQuery>,
+) -> Result<Json<Vec<ContactBookTask>>, (StatusCode, Json<Value>)> {
+    let (db_path, classroom_id) = {
+        let guard = state.runtime.lock().await;
+        (guard.db_path.clone(), guard.current_classroom_id)
+    };
+
+    let conn = Connection::open(db_path).map_err(|error| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("開啟資料庫失敗: {error}"),
+        )
+    })?;
+
+    let tasks = list_tasks_for_classroom(&conn, classroom_id, &query)
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error))?;
+    Ok(Json(tasks))
+}
+
+async fn create_contact_book_task_handler(
+    State(state): State<HttpState>,
+    Json(body): Json<CreateTaskRequest>,
+) -> Result<Json<ContactBookTask>, (StatusCode, Json<Value>)> {
+    let title = body.title.trim();
+    if title.is_empty() {
+        return Err(api_error(StatusCode::BAD_REQUEST, "任務名稱不可為空"));
+    }
+
+    let task_date = normalize_task_date(&body.task_date)
+        .ok_or_else(|| api_error(StatusCode::BAD_REQUEST, "日期格式必須為 YYYY-MM-DD"))?;
+    validate_task_flags(body.show_in_contact_book, body.requires_tracking)
+        .map_err(|error| api_error(StatusCode::BAD_REQUEST, error))?;
+
+    let (db_path, classroom_id) = {
+        let guard = state.runtime.lock().await;
+        (guard.db_path.clone(), guard.current_classroom_id)
+    };
+
+    let conn = Connection::open(db_path).map_err(|error| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("開啟資料庫失敗: {error}"),
+        )
+    })?;
+
+    conn.execute(
+        "INSERT INTO tasks (
+            classroom_id,
+            task_date,
+            title,
+            show_in_contact_book,
+            requires_tracking,
+            is_completed
+         ) VALUES (?1, ?2, ?3, ?4, ?5, 0)",
+        params![
+            classroom_id,
+            task_date,
+            title,
+            to_db_bool(body.show_in_contact_book),
+            to_db_bool(body.requires_tracking)
+        ],
+    )
+    .map_err(|error| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("建立任務失敗: {error}"),
+        )
+    })?;
+
+    let task_id = conn.last_insert_rowid();
+    let task = load_task_for_classroom(&conn, classroom_id, task_id)
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error))?
+        .ok_or_else(|| api_error(StatusCode::INTERNAL_SERVER_ERROR, "建立任務後讀取失敗"))?;
+
+    Ok(Json(task))
+}
+
+async fn update_contact_book_task_handler(
+    State(state): State<HttpState>,
+    Path(task_id): Path<i64>,
+    Json(body): Json<UpdateTaskRequest>,
+) -> Result<Json<ContactBookTask>, (StatusCode, Json<Value>)> {
+    let title = body.title.trim();
+    if title.is_empty() {
+        return Err(api_error(StatusCode::BAD_REQUEST, "任務名稱不可為空"));
+    }
+
+    let task_date = normalize_task_date(&body.task_date)
+        .ok_or_else(|| api_error(StatusCode::BAD_REQUEST, "日期格式必須為 YYYY-MM-DD"))?;
+    validate_task_flags(body.show_in_contact_book, body.requires_tracking)
+        .map_err(|error| api_error(StatusCode::BAD_REQUEST, error))?;
+
+    let (db_path, classroom_id) = {
+        let guard = state.runtime.lock().await;
+        (guard.db_path.clone(), guard.current_classroom_id)
+    };
+
+    let conn = Connection::open(db_path).map_err(|error| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("開啟資料庫失敗: {error}"),
+        )
+    })?;
+
+    let updated = conn
+        .execute(
+            "UPDATE tasks
+                SET task_date = ?1,
+                    title = ?2,
+                    show_in_contact_book = ?3,
+                    requires_tracking = ?4
+              WHERE id = ?5 AND classroom_id = ?6",
+            params![
+                task_date,
+                title,
+                to_db_bool(body.show_in_contact_book),
+                to_db_bool(body.requires_tracking),
+                task_id,
+                classroom_id
+            ],
+        )
+        .map_err(|error| {
+            api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("更新任務失敗: {error}"),
+            )
+        })?;
+
+    if updated == 0 {
+        return Err(api_error(StatusCode::NOT_FOUND, "指定任務不存在"));
+    }
+
+    let task = load_task_for_classroom(&conn, classroom_id, task_id)
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error))?
+        .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "指定任務不存在"))?;
+
+    Ok(Json(task))
+}
+
+async fn delete_contact_book_task_handler(
+    State(state): State<HttpState>,
+    Path(task_id): Path<i64>,
+) -> Result<StatusCode, (StatusCode, Json<Value>)> {
+    let (db_path, classroom_id) = {
+        let guard = state.runtime.lock().await;
+        (guard.db_path.clone(), guard.current_classroom_id)
+    };
+
+    let conn = Connection::open(db_path).map_err(|error| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("開啟資料庫失敗: {error}"),
+        )
+    })?;
+
+    let deleted = conn
+        .execute(
+            "DELETE FROM tasks WHERE id = ?1 AND classroom_id = ?2",
+            params![task_id, classroom_id],
+        )
+        .map_err(|error| {
+            api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("刪除任務失敗: {error}"),
+            )
+        })?;
+
+    if deleted == 0 {
+        return Err(api_error(StatusCode::NOT_FOUND, "指定任務不存在"));
+    }
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn list_task_submissions_handler(
+    State(state): State<HttpState>,
+    Path(task_id): Path<i64>,
+) -> Result<Json<TaskSubmissionsPayload>, (StatusCode, Json<Value>)> {
+    let (db_path, classroom_id) = {
+        let guard = state.runtime.lock().await;
+        (guard.db_path.clone(), guard.current_classroom_id)
+    };
+
+    let conn = Connection::open(db_path).map_err(|error| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("開啟資料庫失敗: {error}"),
+        )
+    })?;
+
+    let task = load_task_for_classroom(&conn, classroom_id, task_id)
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error))?
+        .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "指定任務不存在"))?;
+
+    if !task.requires_tracking {
+        return Err(api_error(StatusCode::BAD_REQUEST, "此任務未啟用繳交控管"));
+    }
+
+    let submissions = load_task_submission_statuses(&conn, classroom_id, task_id)
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error))?;
+
+    Ok(Json(TaskSubmissionsPayload { task, submissions }))
+}
+
+async fn update_task_submission_handler(
+    State(state): State<HttpState>,
+    Path((task_id, student_id)): Path<(i64, i64)>,
+    Json(body): Json<UpdateTaskSubmissionRequest>,
+) -> Result<Json<ContactBookTask>, (StatusCode, Json<Value>)> {
+    let (db_path, classroom_id) = {
+        let guard = state.runtime.lock().await;
+        (guard.db_path.clone(), guard.current_classroom_id)
+    };
+
+    let mut conn = Connection::open(db_path).map_err(|error| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("開啟資料庫失敗: {error}"),
+        )
+    })?;
+
+    let task = load_task_for_classroom(&conn, classroom_id, task_id)
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error))?
+        .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "指定任務不存在"))?;
+
+    if !task.requires_tracking {
+        return Err(api_error(StatusCode::BAD_REQUEST, "此任務未啟用繳交控管"));
+    }
+
+    let student_exists: Option<i64> = conn
+        .query_row(
+            "SELECT id FROM students WHERE id = ?1 AND classroom_id = ?2",
+            params![student_id, classroom_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|error| {
+            api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("查詢學生資料失敗: {error}"),
+            )
+        })?;
+    if student_exists.is_none() {
+        return Err(api_error(StatusCode::NOT_FOUND, "指定學生不存在"));
+    }
+
+    let tx = conn.transaction().map_err(|error| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("建立交易失敗: {error}"),
+        )
+    })?;
+
+    tx.execute(
+        "INSERT INTO task_submissions (task_id, student_id, submitted)
+         VALUES (?1, ?2, ?3)
+         ON CONFLICT(task_id, student_id)
+         DO UPDATE SET submitted = excluded.submitted",
+        params![task_id, student_id, to_db_bool(body.submitted)],
+    )
+    .map_err(|error| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("更新繳交狀態失敗: {error}"),
+        )
+    })?;
+
+    sync_task_completion_from_submissions(&tx, classroom_id, task_id)
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error))?;
+
+    tx.commit().map_err(|error| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("提交繳交狀態失敗: {error}"),
+        )
+    })?;
+
+    let task = load_task_for_classroom(&conn, classroom_id, task_id)
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error))?
+        .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "指定任務不存在"))?;
+
+    Ok(Json(task))
+}
+
+async fn set_task_completion_handler(
+    State(state): State<HttpState>,
+    Path(task_id): Path<i64>,
+    Json(body): Json<SetTaskCompletionRequest>,
+) -> Result<Json<ContactBookTask>, (StatusCode, Json<Value>)> {
+    let (db_path, classroom_id) = {
+        let guard = state.runtime.lock().await;
+        (guard.db_path.clone(), guard.current_classroom_id)
+    };
+
+    let mut conn = Connection::open(db_path).map_err(|error| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("開啟資料庫失敗: {error}"),
+        )
+    })?;
+
+    let task = load_task_for_classroom(&conn, classroom_id, task_id)
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error))?
+        .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "指定任務不存在"))?;
+
+    if !task.requires_tracking {
+        return Err(api_error(StatusCode::BAD_REQUEST, "此任務未啟用繳交控管"));
+    }
+
+    let tx = conn.transaction().map_err(|error| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("建立交易失敗: {error}"),
+        )
+    })?;
+
+    set_all_task_submission_states(&tx, classroom_id, task_id, body.completed)
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error))?;
+
+    tx.commit().map_err(|error| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("提交任務完成狀態失敗: {error}"),
+        )
+    })?;
+
+    let task = load_task_for_classroom(&conn, classroom_id, task_id)
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error))?
+        .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "指定任務不存在"))?;
+
+    Ok(Json(task))
 }
 
 async fn force_logout_classroom_students(
@@ -1598,8 +2296,26 @@ async fn start_server_impl(runtime: Arc<Mutex<BackendRuntime>>) -> Result<Server
         "http://127.0.0.1:1420"
             .parse()
             .expect("valid dev webview origin"),
+        "http://localhost:17860"
+            .parse()
+            .expect("valid app web origin"),
+        "http://127.0.0.1:17860"
+            .parse()
+            .expect("valid app web origin"),
+        "tauri://localhost"
+            .parse()
+            .expect("valid tauri webview origin"),
+        "http://tauri.localhost"
+            .parse()
+            .expect("valid tauri webview origin"),
+        "https://tauri.localhost"
+            .parse()
+            .expect("valid tauri webview origin"),
     ];
     if let Ok(origin) = local_dev_origin.parse::<HeaderValue>() {
+        allowed_origins.push(origin);
+    }
+    if let Ok(origin) = format!("http://{local_ip_host}:17860").parse::<HeaderValue>() {
         allowed_origins.push(origin);
     }
     let cors_layer = CorsLayer::new()
@@ -1628,6 +2344,26 @@ async fn start_server_impl(runtime: Arc<Mutex<BackendRuntime>>) -> Result<Server
         .route(
             "/api/classrooms/{classroom_id}/students/bulk-save",
             post(save_class_members_handler),
+        )
+        .route(
+            "/api/contact-book/tasks",
+            get(list_contact_book_tasks_handler).post(create_contact_book_task_handler),
+        )
+        .route(
+            "/api/contact-book/tasks/{task_id}",
+            patch(update_contact_book_task_handler).delete(delete_contact_book_task_handler),
+        )
+        .route(
+            "/api/contact-book/tasks/{task_id}/submissions",
+            get(list_task_submissions_handler),
+        )
+        .route(
+            "/api/contact-book/tasks/{task_id}/submissions/{student_id}",
+            patch(update_task_submission_handler),
+        )
+        .route(
+            "/api/contact-book/tasks/{task_id}/completion",
+            post(set_task_completion_handler),
         )
         .route("/health", get(health))
         .route_service(

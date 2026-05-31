@@ -10,6 +10,7 @@ import {
 } from "vue";
 import QrcodeVue from "qrcode.vue";
 import WhiteboardCanvas from "../components/WhiteboardCanvas.vue";
+import ContactBookManager from "../components/ContactBookManager.vue";
 import StudentListCard from "../components/StudentListCard.vue";
 import { useAppVersion } from "../composables/useAppVersion";
 import { createPeerConnection } from "../composables/usePeerConnection";
@@ -59,6 +60,7 @@ const { appVersionLabel } = useAppVersion(props.baseUrl);
 
 const students = ref<StudentSession[]>([]);
 const currentClassroomName = ref("載入中");
+const currentClassroomId = ref<number | null>(null);
 const wsStatus = ref("尚未連線");
 const rtcError = ref("");
 const rtcErrorVisible = ref(false);
@@ -89,7 +91,6 @@ const studentFocusStatusById = reactive(new Map<string, StudentFocusStatus>());
 const studentFocusUpdatedAtById = reactive(new Map<string, number>());
 const teacherBroadcastStarting = ref(false);
 const teacherBroadcastStream = ref<MediaStream | null>(null);
-const broadcastQualityPreset = ref<"balanced">("balanced");
 
 const whiteboardBackgroundOptions = [
   { fileName: null, displayName: "空白" },
@@ -243,9 +244,6 @@ const teacherBroadcastCaptureSupportError = computed(() => {
 
   return "";
 });
-const broadcastQualityOptions = [
-  { value: "balanced", title: "720p / 15fps" },
-] as const;
 
 function toActiveModule(mode: WhiteboardMode): ActiveModule {
   switch (mode) {
@@ -257,6 +255,8 @@ function toActiveModule(mode: WhiteboardMode): ActiveModule {
       return "quick_qa";
     case "teacher-broadcast":
       return "teacher_screen_broadcast";
+    case "contact-book":
+      return "contact_book_management";
   }
 }
 
@@ -1518,6 +1518,10 @@ function activateQuickQa() {
   applyFeatureMode("quick-qa");
 }
 
+function activateContactBook() {
+  applyFeatureMode("contact-book");
+}
+
 function activateTeacherBoardTab() {
   applyWhiteboardTab("teacher-board");
 }
@@ -1946,6 +1950,7 @@ async function handleSignal(message: SignalEnvelope) {
     const payload = message.payload as { state?: ClassroomStatePayload };
     if (payload?.state) {
       currentClassroomName.value = payload.state.current_classroom.name;
+      currentClassroomId.value = payload.state.current_classroom.id;
     }
     return;
   }
@@ -2170,6 +2175,13 @@ onBeforeUnmount(() => {
           首頁
         </v-btn>
         <v-btn
+          color="brown"
+          :variant="activeFeature === 'contact-book' ? 'flat' : 'outlined'"
+          @click="activateContactBook"
+        >
+          聯絡簿管理
+        </v-btn>
+        <v-btn
           color="primary"
           :variant="activeFeature === 'whiteboard' ? 'flat' : 'outlined'"
           @click="activateWhiteboard"
@@ -2197,17 +2209,6 @@ onBeforeUnmount(() => {
         <v-btn color="info" variant="tonal" @click="openStudentUrlDialog">
           學生開啟網頁
         </v-btn>
-        <v-select
-          v-model="broadcastQualityPreset"
-          :items="broadcastQualityOptions"
-          item-title="title"
-          item-value="value"
-          density="compact"
-          hide-details
-          label="廣播畫質"
-          variant="outlined"
-          disabled
-        />
       </div>
       <v-alert
         v-if="teacherBroadcastCaptureSupportError"
@@ -2307,7 +2308,21 @@ onBeforeUnmount(() => {
     </v-navigation-drawer>
     <v-main class="teacher-main">
       <div class="feature-main pa-3">
-        <div v-if="activeFeature === 'whiteboard'" class="whiteboard-layout">
+        <div
+          v-if="activeFeature === 'contact-book'"
+          class="contact-book-layout"
+        >
+          <ContactBookManager
+            :base-url="props.baseUrl"
+            :classroom-id="currentClassroomId"
+            @error="showRtcError"
+          />
+        </div>
+
+        <div
+          v-else-if="activeFeature === 'whiteboard'"
+          class="whiteboard-layout"
+        >
           <div class="whiteboard-canvas-wrap d-flex flex-column ga-3">
             <v-tabs
               color="primary"
@@ -2965,6 +2980,11 @@ onBeforeUnmount(() => {
 }
 
 .feature-main {
+  height: 100%;
+  min-height: 0;
+}
+
+.contact-book-layout {
   height: 100%;
   min-height: 0;
 }

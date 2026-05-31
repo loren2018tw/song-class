@@ -15,12 +15,14 @@ export type WhiteboardTool = "pen" | "eraser";
 export type WhiteboardColor = (typeof WHITEBOARD_COLOR_OPTIONS)[number];
 export type WhiteboardMode =
   | "home"
+  | "contact-book"
   | "whiteboard"
   | "quick-qa"
   | "teacher-broadcast";
 
 export type ActiveModule =
   | "home"
+  | "contact_book_management"
   | "whiteboard"
   | "quick_qa"
   | "teacher_screen_broadcast";

@@ -60,7 +60,7 @@ song-class 是一個以「課堂即時互動」為核心的跨平台教學系統
 
 ### windows
 
-...
+%APPDATA%\Local\boats.loren.song-class/song-class.sqlite3
 
 ## 快速開始
 
