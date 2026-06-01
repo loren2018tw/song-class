@@ -2027,6 +2027,30 @@ async fn handle_socket(
                 message: None,
             },
         );
+
+        let teacher_ready_for_students = SignalEnvelope {
+            event: "teacher-ready".to_string(),
+            source: Some(connection_id.clone()),
+            target: None,
+            nickname: None,
+            payload: None,
+            message: None,
+        };
+
+        if let Ok(raw) = serde_json::to_string(&teacher_ready_for_students) {
+            let mut stale_students = Vec::new();
+            for (student_id, tx) in &guard.student_channels {
+                if tx.send(raw.clone()).is_err() {
+                    stale_students.push(student_id.clone());
+                }
+            }
+
+            for student_id in stale_students {
+                guard.student_channels.remove(&student_id);
+                guard.students.remove(&student_id);
+            }
+        }
+
         drop(guard);
         if let Ok(state) = build_classroom_state(&runtime).await {
             send_json(
@@ -2110,6 +2134,23 @@ async fn handle_socket(
         };
 
         match incoming.event.as_str() {
+            "force-logout-all-students" if is_teacher => {
+                let classroom_id = {
+                    let guard = runtime.lock().await;
+                    guard.current_classroom_id
+                };
+
+                force_logout_classroom_students(
+                    &hub,
+                    classroom_id,
+                    "teacher-force-logout",
+                    "教師已要求所有學生重新選擇座號加入",
+                )
+                .await;
+
+                broadcast_student_list(&hub).await;
+                broadcast_classroom_state(&runtime).await;
+            }
             "join" if !is_teacher && !is_console => {
                 let Some(payload) = incoming.payload.clone() else {
                     send_ws_error(&out_tx, "缺少班級與座號資訊");

@@ -45,6 +45,7 @@ import {
   type WhiteboardSnapshotSyncMessage,
   type WhiteboardTeacherBoardControlMessage,
   type WhiteboardStudentBoardControlMessage,
+  type WhiteboardStudentSwitchBoardMessage,
   type WhiteboardStudentEventBatchMessage,
   type WhiteboardTeacherStudentEventBatchMessage,
   type WhiteboardStudentViewControlMessage,
@@ -867,6 +868,13 @@ function toStudentViewControlMessage(): WhiteboardStudentViewControlMessage {
   };
 }
 
+function toStudentSwitchBoardMessage(): WhiteboardStudentSwitchBoardMessage {
+  return {
+    kind: "student-switch-board",
+    boardTab: "student-board",
+  };
+}
+
 function toQuickQaStateMessage(
   reason: QuickQaStateMessage["reason"],
 ): QuickQaStateMessage {
@@ -1539,6 +1547,25 @@ function onForceTeacherBoardViewChanged(value: boolean | null) {
   }
 
   broadcastToLessonChannels(toStudentViewControlMessage());
+}
+
+function switchStudentsToOwnBoard() {
+  broadcastToLessonChannels(toStudentSwitchBoardMessage());
+}
+
+function forceLogoutAllStudents() {
+  if (students.value.length === 0) {
+    return;
+  }
+
+  if (!ws || ws.readyState !== WebSocket.OPEN) {
+    showRtcError("尚未連線到訊號服務，無法退出所有學生");
+    return;
+  }
+
+  sendSignal({
+    event: "force-logout-all-students",
+  });
 }
 
 function openStudentUrlDialog() {
@@ -2304,6 +2331,16 @@ onBeforeUnmount(() => {
           title="已連入學生"
           :students="sortedStudentsForChipList"
         />
+        <v-btn
+          class="mt-2"
+          color="error"
+          variant="tonal"
+          block
+          :disabled="students.length === 0"
+          @click="forceLogoutAllStudents"
+        >
+          退出所有學生
+        </v-btn>
       </div>
     </v-navigation-drawer>
     <v-main class="teacher-main">
@@ -2394,6 +2431,16 @@ onBeforeUnmount(() => {
                 label="強制觀看教師白板"
                 @update:model-value="onForceTeacherBoardViewChanged"
               />
+
+              <v-btn
+                color="primary"
+                variant="tonal"
+                block
+                :disabled="forceTeacherBoardView"
+                @click="switchStudentsToOwnBoard"
+              >
+                學生切換為自己白板
+              </v-btn>
 
               <v-btn
                 color="error"

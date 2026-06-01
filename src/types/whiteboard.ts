@@ -218,6 +218,11 @@ export interface WhiteboardStudentViewControlMessage {
   forceTeacherBoardView: boolean;
 }
 
+export interface WhiteboardStudentSwitchBoardMessage {
+  kind: "student-switch-board";
+  boardTab: "student-board";
+}
+
 export interface WhiteboardStudentOpenUrlMessage {
   kind: "student-open-url";
   url: string;
@@ -242,6 +247,7 @@ export type WhiteboardSyncMessage =
   | WhiteboardTeacherBoardControlMessage
   | WhiteboardStudentBoardControlMessage
   | WhiteboardStudentViewControlMessage
+  | WhiteboardStudentSwitchBoardMessage
   | WhiteboardStudentOpenUrlMessage
   | StudentFocusStatusMessage
   | QuickQaStateMessage
@@ -323,6 +329,7 @@ export function isWhiteboardSyncMessage(
     kind === "teacher-board-control" ||
     kind === "student-board-control" ||
     kind === "student-view-control" ||
+    kind === "student-switch-board" ||
     kind === "student-open-url" ||
     kind === "student-focus-status" ||
     kind === "quick-qa-state" ||

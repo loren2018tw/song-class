@@ -82,6 +82,7 @@ let pendingJoinSelection: { classroomId: number; seatNoText: string } | null =
   null;
 const queuedIceCandidates: RTCIceCandidateInit[] = [];
 const isJoinRequested = ref(false);
+const joinedSessionId = ref<string | null>(null);
 
 const wsUrl = computed(() => {
   const base = new URL(props.baseUrl);
@@ -119,6 +120,51 @@ const quickQaFeedback = computed(() => {
 const quickQaAnswerDisabled = computed(
   () => !quickQaQuestion.value || quickQaQuestion.value.status !== "open",
 );
+const hasJoinedClassroom = computed(() => joinedSessionId.value !== null);
+
+function disposePeerConnection() {
+  if (lessonChannel) {
+    lessonChannel.onopen = null;
+    lessonChannel.onmessage = null;
+    lessonChannel.onclose = null;
+    lessonChannel.onerror = null;
+    lessonChannel.close();
+    lessonChannel = null;
+  }
+
+  if (peer) {
+    peer.close();
+    peer = null;
+  }
+
+  queuedIceCandidates.length = 0;
+}
+
+function handleLessonTransportInterrupted(message: string) {
+  if (!selfId) {
+    resetToJoinState(message);
+    return;
+  }
+
+  isConnected.value = false;
+  isJoinRequested.value = false;
+  activeMode.value = "home";
+  activeTab.value = "teacher-board";
+  isTeacherBoardViewForced.value = false;
+  modeVersion.value = 0;
+  tabVersion.value = 0;
+  teacherLastAppliedSequence.value = 0;
+  teacherStudentLastAppliedSequence.value = 0;
+  pendingFocusStatus = null;
+  lastSentFocusStatus = null;
+  stopStudentBatchTimer();
+  stopFocusStatusDebounceTimer();
+  setTeacherBroadcastStream(null);
+  disposePeerConnection();
+  teacherId = undefined;
+  statusText.value = message;
+  signalError.value = "";
+}
 
 function setTeacherBroadcastStream(stream: MediaStream | null) {
   teacherBroadcastStream.value = stream;
@@ -390,6 +436,7 @@ function resetToJoinState(message = "連線已中斷，請重新加入") {
   isJoinRequested.value = false;
   teacherId = undefined;
   selfId = undefined;
+  joinedSessionId.value = null;
   activeMode.value = "home";
   activeTab.value = "teacher-board";
   isTeacherBoardViewForced.value = false;
@@ -407,17 +454,7 @@ function resetToJoinState(message = "連線已中斷，請重新加入") {
   stopFocusStatusDebounceTimer();
   pendingFocusStatus = null;
   lastSentFocusStatus = null;
-  queuedIceCandidates.length = 0;
-
-  if (lessonChannel) {
-    lessonChannel.close();
-    lessonChannel = null;
-  }
-
-  if (peer) {
-    peer.close();
-    peer = null;
-  }
+  disposePeerConnection();
 
   statusText.value = message;
 }
@@ -499,7 +536,26 @@ function ensureSocket() {
       const message = JSON.parse(event.data) as SignalEnvelope;
 
       if (message.event === "error") {
+        if (
+          message.message === "找不到可用目標端" &&
+          hasJoinedClassroom.value &&
+          !isConnected.value
+        ) {
+          statusText.value = "教師端尚未就緒，等待重新連線...";
+          signalError.value = "";
+          return;
+        }
+
         signalError.value = message.message ?? "發生未知錯誤";
+        return;
+      }
+
+      if (message.event === "teacher-ready") {
+        teacherId = message.source;
+        if (hasJoinedClassroom.value && !isConnected.value) {
+          statusText.value = "教師端已就緒，重新建立連線中...";
+          await startOffer();
+        }
         return;
       }
 
@@ -513,12 +569,13 @@ function ensureSocket() {
 
       if (message.event === "force-logout") {
         resetToJoinState(message.message ?? "班級已切換，請重新加入");
-        signalError.value = message.message ?? "班級已切換，請重新加入";
+        signalError.value = "";
         return;
       }
 
       if (message.event === "joined") {
         selfId = message.source;
+        joinedSessionId.value = message.source ?? null;
         teacherId = message.target;
         statusText.value = "加入成功，建立 WebRTC 連線中...";
         await startOffer();
@@ -856,6 +913,15 @@ function handleLessonMessage(raw: string) {
     return;
   }
 
+  if (parsed.kind === "student-switch-board") {
+    if (parsed.boardTab === "student-board") {
+      activeMode.value = "whiteboard";
+      activeTab.value = "student-board";
+    }
+
+    return;
+  }
+
   if (parsed.kind === "student-open-url") {
     openTeacherAssignedUrl(parsed.url);
     return;
@@ -893,7 +959,7 @@ function bindLessonChannel(channel: RTCDataChannel) {
   };
 
   lessonChannel.onclose = () => {
-    resetToJoinState("資料通道已關閉，請重新加入");
+    handleLessonTransportInterrupted("教師端連線中斷，等待重新連線...");
   };
 
   lessonChannel.onerror = () => {
@@ -920,10 +986,17 @@ function leaveClassroom() {
 }
 
 async function startOffer() {
+  if (!selfId) {
+    statusText.value = "尚未加入教室";
+    return;
+  }
+
   if (!teacherId) {
     statusText.value = "等待教師端就緒";
     return;
   }
+
+  disposePeerConnection();
 
   peer = createPeerConnection({
     onIceCandidate: (candidate) => {
@@ -939,7 +1012,7 @@ async function startOffer() {
     },
     onConnectionStateChange: (state) => {
       if (["disconnected", "failed", "closed"].includes(state)) {
-        resetToJoinState("連線已中斷，請重新加入");
+        handleLessonTransportInterrupted("教師端連線中斷，等待重新連線...");
       }
     },
     onTrack: (event) => {
@@ -1056,7 +1129,7 @@ onBeforeUnmount(() => {
     <v-app-bar title="song-class(學生端)">
       <template #append>
         <v-btn
-          v-if="isConnected"
+          v-if="hasJoinedClassroom"
           class="mr-2"
           color="error"
           variant="outlined"
@@ -1074,7 +1147,7 @@ onBeforeUnmount(() => {
         <v-row justify="center">
           <v-col cols="12" md="8" lg="7">
             <RosterJoinCard
-              v-if="!isConnected"
+              v-if="!hasJoinedClassroom"
               :classroom="classroomState?.current_classroom ?? null"
               :students="classroomState?.students ?? []"
               :loading="isJoinRequested"
