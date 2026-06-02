@@ -27,6 +27,13 @@ use uuid::Uuid;
 const DEFAULT_PORT: u16 = 17860;
 const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 
+fn resolve_app_version(app: &tauri::App) -> String {
+    app.config()
+        .version
+        .clone()
+        .unwrap_or_else(|| APP_VERSION.to_string())
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "kebab-case")]
 enum ServiceStatus {
@@ -132,6 +139,7 @@ struct ClassroomStatePayload {
 struct HttpState {
     runtime: Arc<Mutex<BackendRuntime>>,
     hub: Arc<Mutex<SessionHub>>,
+    app_version: String,
 }
 
 struct BackendRuntime {
@@ -148,10 +156,12 @@ struct BackendRuntime {
 #[derive(Clone)]
 struct BackendState {
     inner: Arc<Mutex<BackendRuntime>>,
+    app_version: String,
 }
 
 impl BackendState {
     fn new(
+        app_version: String,
         frontend_assets_root: PathBuf,
         frontend_assets_candidates: Vec<PathBuf>,
         tauri_resource_dir: Option<String>,
@@ -159,6 +169,7 @@ impl BackendState {
         current_classroom_id: i64,
     ) -> Self {
         Self {
+            app_version,
             inner: Arc::new(Mutex::new(BackendRuntime {
                 control: ServerControl::new(DEFAULT_PORT),
                 hub: Arc::new(Mutex::new(SessionHub::default())),
@@ -328,10 +339,10 @@ async fn health() -> impl IntoResponse {
     Json(json!({ "ok": true }))
 }
 
-async fn app_version() -> impl IntoResponse {
+async fn app_version(state: State<HttpState>) -> impl IntoResponse {
     (
         [(ACCESS_CONTROL_ALLOW_ORIGIN, "*")],
-        Json(json!({ "version": APP_VERSION })),
+        Json(json!({ "version": state.app_version.clone() })),
     )
 }
 
@@ -2300,7 +2311,10 @@ async fn handle_socket(
     writer_task.abort();
 }
 
-async fn start_server_impl(runtime: Arc<Mutex<BackendRuntime>>) -> Result<ServerInfo, String> {
+async fn start_server_impl(
+    runtime: Arc<Mutex<BackendRuntime>>,
+    runtime_app_version: String,
+) -> Result<ServerInfo, String> {
     let (port, hub, frontend_assets_root) = {
         let mut guard = runtime.lock().await;
         if guard.running.is_some() {
@@ -2417,6 +2431,7 @@ async fn start_server_impl(runtime: Arc<Mutex<BackendRuntime>>) -> Result<Server
         .with_state(HttpState {
             runtime: runtime.clone(),
             hub,
+            app_version: runtime_app_version,
         });
 
     if cfg!(debug_assertions) {
@@ -2475,7 +2490,7 @@ async fn stop_server_impl(runtime: Arc<Mutex<BackendRuntime>>) -> Result<ServerI
 
 #[tauri::command]
 async fn start_server(state: tauri::State<'_, BackendState>) -> Result<ServerInfo, String> {
-    start_server_impl(state.inner.clone()).await
+    start_server_impl(state.inner.clone(), state.app_version.clone()).await
 }
 
 #[tauri::command]
@@ -2524,8 +2539,8 @@ async fn get_server_debug_info(
 }
 
 #[tauri::command]
-fn get_app_version() -> String {
-    APP_VERSION.to_string()
+fn get_app_version(state: tauri::State<'_, BackendState>) -> String {
+    state.app_version.clone()
 }
 
 fn collect_frontend_assets_candidates(app: &tauri::AppHandle) -> Vec<PathBuf> {
@@ -2647,17 +2662,21 @@ pub fn run() {
             let db_path = db_dir.join("song-class.sqlite3");
             let current_classroom_id = init_database(&db_path)
                 .map_err(|error| std::io::Error::new(std::io::ErrorKind::Other, error))?;
+            let runtime_app_version = resolve_app_version(&app);
 
             app.manage(BackendState::new(
+                runtime_app_version.clone(),
                 frontend_assets_root,
                 frontend_assets_candidates,
                 tauri_resource_dir,
                 db_path,
                 current_classroom_id,
             ));
-            let runtime = app.state::<BackendState>().inner.clone();
+            let backend_state = app.state::<BackendState>();
+            let runtime = backend_state.inner.clone();
+            let app_version = backend_state.app_version.clone();
             tauri::async_runtime::spawn(async move {
-                let _ = start_server_impl(runtime).await;
+                let _ = start_server_impl(runtime, app_version).await;
             });
             Ok(())
         })

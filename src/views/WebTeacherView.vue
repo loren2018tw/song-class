@@ -2288,70 +2288,6 @@ onBeforeUnmount(() => {
       <div>
         <p class="text-medium-emphasis mb-0">WebSocket: {{ wsStatus }}</p>
       </div>
-      <v-card rounded="lg" variant="outlined" class="ma-2 diag-card">
-        <v-card-title class="py-2 d-flex align-center justify-space-between">
-          <span class="text-subtitle-2">白板診斷</span>
-          <v-btn
-            size="x-small"
-            variant="text"
-            :icon="
-              whiteboardDiagnosticsVisible
-                ? 'mdi-chevron-up'
-                : 'mdi-chevron-down'
-            "
-            @click="
-              whiteboardDiagnosticsVisible = !whiteboardDiagnosticsVisible
-            "
-          />
-        </v-card-title>
-        <v-expand-transition>
-          <v-card-text
-            v-show="whiteboardDiagnosticsVisible"
-            class="py-2 px-3 d-flex flex-column ga-1"
-          >
-            <div class="diag-line">
-              事件/秒: {{ whiteboardDiagEventsPerSecond }}
-            </div>
-            <div class="diag-line">
-              批次/秒: {{ whiteboardDiagBatchesPerSecond }}
-            </div>
-            <div class="diag-line">總事件: {{ whiteboardDiagTotalEvents }}</div>
-            <div class="diag-line">
-              傳輸延遲 Avg/Max:
-              {{ whiteboardDiagAvgTransportLagMs.toFixed(1) }} /
-              {{ whiteboardDiagMaxTransportLagMs.toFixed(1) }} ms
-            </div>
-            <div class="diag-line">
-              批次耗時 Avg/Max:
-              {{ whiteboardDiagAvgBatchProcessMs.toFixed(2) }} /
-              {{ whiteboardDiagMaxBatchProcessMs.toFixed(2) }} ms
-            </div>
-            <div class="diag-line">
-              掉點次數: {{ whiteboardDiagDroppedStrokePoints }}
-            </div>
-            <div class="diag-line">
-              最近批次:
-              {{
-                whiteboardDiagLastBatchAt
-                  ? new Date(whiteboardDiagLastBatchAt).toLocaleTimeString(
-                      "zh-TW",
-                      { hour12: false },
-                    )
-                  : "--"
-              }}
-            </div>
-            <v-btn
-              class="mt-1"
-              size="x-small"
-              variant="outlined"
-              color="primary"
-              @click="resetWhiteboardDiagnostics"
-            >
-              重設診斷
-            </v-btn>
-          </v-card-text>
-        </v-expand-transition>
-      </v-card>
       <div class="d-flex flex-column ga-3 align-stretch">
         <v-btn
           color="secondary"
@@ -2650,6 +2586,75 @@ onBeforeUnmount(() => {
                 variant="outlined"
                 hide-details
               />
+
+              <v-card rounded="lg" variant="outlined" class="diag-card">
+                <v-card-title
+                  class="py-2 d-flex align-center justify-space-between"
+                >
+                  <span class="text-subtitle-2">白板診斷</span>
+                  <v-btn
+                    size="x-small"
+                    variant="text"
+                    :icon="
+                      whiteboardDiagnosticsVisible
+                        ? 'mdi-chevron-up'
+                        : 'mdi-chevron-down'
+                    "
+                    @click="
+                      whiteboardDiagnosticsVisible =
+                        !whiteboardDiagnosticsVisible
+                    "
+                  />
+                </v-card-title>
+                <v-expand-transition>
+                  <v-card-text
+                    v-show="whiteboardDiagnosticsVisible"
+                    class="py-2 px-3 d-flex flex-column ga-1"
+                  >
+                    <div class="diag-line">
+                      事件/秒: {{ whiteboardDiagEventsPerSecond }}
+                    </div>
+                    <div class="diag-line">
+                      批次/秒: {{ whiteboardDiagBatchesPerSecond }}
+                    </div>
+                    <div class="diag-line">
+                      總事件: {{ whiteboardDiagTotalEvents }}
+                    </div>
+                    <div class="diag-line">
+                      傳輸延遲 Avg/Max:
+                      {{ whiteboardDiagAvgTransportLagMs.toFixed(1) }} /
+                      {{ whiteboardDiagMaxTransportLagMs.toFixed(1) }} ms
+                    </div>
+                    <div class="diag-line">
+                      批次耗時 Avg/Max:
+                      {{ whiteboardDiagAvgBatchProcessMs.toFixed(2) }} /
+                      {{ whiteboardDiagMaxBatchProcessMs.toFixed(2) }} ms
+                    </div>
+                    <div class="diag-line">
+                      掉點次數: {{ whiteboardDiagDroppedStrokePoints }}
+                    </div>
+                    <div class="diag-line">
+                      最近批次:
+                      {{
+                        whiteboardDiagLastBatchAt
+                          ? new Date(
+                              whiteboardDiagLastBatchAt,
+                            ).toLocaleTimeString("zh-TW", { hour12: false })
+                          : "--"
+                      }}
+                    </div>
+                    <v-btn
+                      class="mt-1"
+                      size="x-small"
+                      variant="outlined"
+                      color="primary"
+                      @click="resetWhiteboardDiagnostics"
+                    >
+                      重設診斷
+                    </v-btn>
+                  </v-card-text>
+                </v-expand-transition>
+              </v-card>
             </v-card-text>
           </v-card>
         </div>
