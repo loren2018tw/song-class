@@ -92,6 +92,17 @@ const studentFocusStatusById = reactive(new Map<string, StudentFocusStatus>());
 const studentFocusUpdatedAtById = reactive(new Map<string, number>());
 const teacherBroadcastStarting = ref(false);
 const teacherBroadcastStream = ref<MediaStream | null>(null);
+const whiteboardDiagnosticsVisible = ref(true);
+const whiteboardDiagEventsPerSecond = ref(0);
+const whiteboardDiagBatchesPerSecond = ref(0);
+const whiteboardDiagTotalEvents = ref(0);
+const whiteboardDiagTotalBatches = ref(0);
+const whiteboardDiagAvgTransportLagMs = ref(0);
+const whiteboardDiagMaxTransportLagMs = ref(0);
+const whiteboardDiagAvgBatchProcessMs = ref(0);
+const whiteboardDiagMaxBatchProcessMs = ref(0);
+const whiteboardDiagDroppedStrokePoints = ref(0);
+const whiteboardDiagLastBatchAt = ref<number | null>(null);
 
 const whiteboardBackgroundOptions = [
   { fileName: null, displayName: "空白" },
@@ -143,9 +154,94 @@ let teacherBatchFlushTimer: number | null = null;
 let ws: WebSocket | null = null;
 let countdownTimerId: number | null = null;
 let countdownAudioContext: AudioContext | null = null;
+let whiteboardDiagWindowEvents = 0;
+let whiteboardDiagWindowBatches = 0;
+let whiteboardDiagTransportLagTotalMs = 0;
+let whiteboardDiagTransportLagCount = 0;
+let whiteboardDiagBatchProcessTotalMs = 0;
+let whiteboardDiagBatchProcessCount = 0;
+let whiteboardDiagTickTimer: number | null = null;
 
 const BATCH_INTERVAL_MS = 33;
 const BATCH_MAX_EVENTS = 24;
+
+function startWhiteboardDiagnosticsTicker() {
+  if (whiteboardDiagTickTimer !== null) {
+    return;
+  }
+
+  whiteboardDiagTickTimer = window.setInterval(() => {
+    whiteboardDiagEventsPerSecond.value = whiteboardDiagWindowEvents;
+    whiteboardDiagBatchesPerSecond.value = whiteboardDiagWindowBatches;
+    whiteboardDiagWindowEvents = 0;
+    whiteboardDiagWindowBatches = 0;
+  }, 1000);
+}
+
+function stopWhiteboardDiagnosticsTicker() {
+  if (whiteboardDiagTickTimer === null) {
+    return;
+  }
+
+  window.clearInterval(whiteboardDiagTickTimer);
+  whiteboardDiagTickTimer = null;
+}
+
+function recordStudentBatchReceive(events: WhiteboardIncrementalEvent[]) {
+  const now = Date.now();
+  whiteboardDiagLastBatchAt.value = now;
+  whiteboardDiagWindowBatches += 1;
+  whiteboardDiagWindowEvents += events.length;
+  whiteboardDiagTotalBatches.value += 1;
+  whiteboardDiagTotalEvents.value += events.length;
+
+  for (const event of events) {
+    if (!Number.isFinite(event.timestamp) || event.timestamp <= 0) {
+      continue;
+    }
+
+    const lag = Math.max(0, now - event.timestamp);
+    whiteboardDiagTransportLagTotalMs += lag;
+    whiteboardDiagTransportLagCount += 1;
+    whiteboardDiagAvgTransportLagMs.value =
+      whiteboardDiagTransportLagTotalMs / whiteboardDiagTransportLagCount;
+    whiteboardDiagMaxTransportLagMs.value = Math.max(
+      whiteboardDiagMaxTransportLagMs.value,
+      lag,
+    );
+  }
+}
+
+function recordStudentBatchProcessDuration(durationMs: number) {
+  whiteboardDiagBatchProcessTotalMs += durationMs;
+  whiteboardDiagBatchProcessCount += 1;
+  whiteboardDiagAvgBatchProcessMs.value =
+    whiteboardDiagBatchProcessTotalMs / whiteboardDiagBatchProcessCount;
+  whiteboardDiagMaxBatchProcessMs.value = Math.max(
+    whiteboardDiagMaxBatchProcessMs.value,
+    durationMs,
+  );
+}
+
+function resetWhiteboardDiagnostics() {
+  whiteboardDiagWindowEvents = 0;
+  whiteboardDiagWindowBatches = 0;
+  whiteboardDiagTransportLagTotalMs = 0;
+  whiteboardDiagTransportLagCount = 0;
+  whiteboardDiagBatchProcessTotalMs = 0;
+  whiteboardDiagBatchProcessCount = 0;
+
+  whiteboardDiagEventsPerSecond.value = 0;
+  whiteboardDiagBatchesPerSecond.value = 0;
+  whiteboardDiagTotalEvents.value = 0;
+  whiteboardDiagTotalBatches.value = 0;
+  whiteboardDiagAvgTransportLagMs.value = 0;
+  whiteboardDiagMaxTransportLagMs.value = 0;
+  whiteboardDiagAvgBatchProcessMs.value = 0;
+  whiteboardDiagMaxBatchProcessMs.value = 0;
+  whiteboardDiagDroppedStrokePoints.value = 0;
+  whiteboardDiagLastBatchAt.value = null;
+}
 
 function isStudentFocusStatus(value: unknown): value is StudentFocusStatus {
   return value === "focused" || value === "away";
@@ -1637,6 +1733,7 @@ function applyIncrementalEvent(
       const stroke = ensureStroke(snapshot, event);
       if (!stroke) {
         // 在不保證事件完整順序的模式下，缺少對應筆劃時直接略過該點。
+        whiteboardDiagDroppedStrokePoints.value += 1;
         break;
       }
       stroke.points.push({ x: event.point.x, y: event.point.y });
@@ -1684,6 +1781,7 @@ function processStudentBatch(
   studentId: string,
   message: WhiteboardStudentEventBatchMessage,
 ) {
+  const processStartedAt = performance.now();
   const nextSnapshot =
     studentBoardSnapshots.get(studentId) ?? createEmptyWhiteboardSnapshot();
 
@@ -1693,6 +1791,7 @@ function processStudentBatch(
 
   setStudentSnapshot(studentId, nextSnapshot);
   studentBoardLastSequence.set(studentId, message.endSeq);
+  recordStudentBatchProcessDuration(performance.now() - processStartedAt);
 }
 
 function clearAllStudentBoards() {
@@ -1805,6 +1904,7 @@ function handleChannelMessage(studentId: string, raw: string) {
         return;
       }
 
+      recordStudentBatchReceive(message.events);
       processStudentBatch(studentId, message);
     }
   } catch (error) {
@@ -2090,6 +2190,7 @@ watch(
 
 onMounted(() => {
   connectTeacherSocket();
+  startWhiteboardDiagnosticsTicker();
   window.addEventListener("keydown", handleGlobalKeydown);
 
   void nextTick(() => {
@@ -2105,6 +2206,7 @@ onMounted(() => {
 });
 
 onBeforeUnmount(() => {
+  stopWhiteboardDiagnosticsTicker();
   stopTeacherBroadcastTrack();
 
   stopCountdownTimer();
@@ -2186,6 +2288,70 @@ onBeforeUnmount(() => {
       <div>
         <p class="text-medium-emphasis mb-0">WebSocket: {{ wsStatus }}</p>
       </div>
+      <v-card rounded="lg" variant="outlined" class="ma-2 diag-card">
+        <v-card-title class="py-2 d-flex align-center justify-space-between">
+          <span class="text-subtitle-2">白板診斷</span>
+          <v-btn
+            size="x-small"
+            variant="text"
+            :icon="
+              whiteboardDiagnosticsVisible
+                ? 'mdi-chevron-up'
+                : 'mdi-chevron-down'
+            "
+            @click="
+              whiteboardDiagnosticsVisible = !whiteboardDiagnosticsVisible
+            "
+          />
+        </v-card-title>
+        <v-expand-transition>
+          <v-card-text
+            v-show="whiteboardDiagnosticsVisible"
+            class="py-2 px-3 d-flex flex-column ga-1"
+          >
+            <div class="diag-line">
+              事件/秒: {{ whiteboardDiagEventsPerSecond }}
+            </div>
+            <div class="diag-line">
+              批次/秒: {{ whiteboardDiagBatchesPerSecond }}
+            </div>
+            <div class="diag-line">總事件: {{ whiteboardDiagTotalEvents }}</div>
+            <div class="diag-line">
+              傳輸延遲 Avg/Max:
+              {{ whiteboardDiagAvgTransportLagMs.toFixed(1) }} /
+              {{ whiteboardDiagMaxTransportLagMs.toFixed(1) }} ms
+            </div>
+            <div class="diag-line">
+              批次耗時 Avg/Max:
+              {{ whiteboardDiagAvgBatchProcessMs.toFixed(2) }} /
+              {{ whiteboardDiagMaxBatchProcessMs.toFixed(2) }} ms
+            </div>
+            <div class="diag-line">
+              掉點次數: {{ whiteboardDiagDroppedStrokePoints }}
+            </div>
+            <div class="diag-line">
+              最近批次:
+              {{
+                whiteboardDiagLastBatchAt
+                  ? new Date(whiteboardDiagLastBatchAt).toLocaleTimeString(
+                      "zh-TW",
+                      { hour12: false },
+                    )
+                  : "--"
+              }}
+            </div>
+            <v-btn
+              class="mt-1"
+              size="x-small"
+              variant="outlined"
+              color="primary"
+              @click="resetWhiteboardDiagnostics"
+            >
+              重設診斷
+            </v-btn>
+          </v-card-text>
+        </v-expand-transition>
+      </v-card>
       <div class="d-flex flex-column ga-3 align-stretch">
         <v-btn
           color="secondary"
@@ -3127,6 +3293,16 @@ onBeforeUnmount(() => {
 
 .teacher-student-list-card :deep(.v-card-title > span) {
   font-size: 0.95rem;
+}
+
+.diag-card {
+  margin-top: 8px;
+}
+
+.diag-line {
+  font-size: 0.72rem;
+  line-height: 1.3;
+  color: rgba(var(--v-theme-on-surface), 0.88);
 }
 
 .countdown-mini-card {
