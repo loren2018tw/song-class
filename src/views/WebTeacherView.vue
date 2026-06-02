@@ -391,6 +391,7 @@ const quickQaLeaderboardTop10 = computed(() => {
 });
 
 const teacherBackgroundImage = computed(() => teacherBackground.value);
+const EMPTY_READONLY_SNAPSHOT = createEmptyWhiteboardSnapshot();
 const studentBoardTiles = computed(() => {
   return [...students.value]
     .sort((left, right) =>
@@ -401,7 +402,7 @@ const studentBoardTiles = computed(() => {
       nickname: student.nickname,
       snapshot:
         studentBoardSnapshots.get(student.connection_id) ??
-        createEmptyWhiteboardSnapshot(),
+        EMPTY_READONLY_SNAPSHOT,
     }));
 });
 const coeditStudent = computed(() => {
@@ -417,12 +418,11 @@ const coeditStudent = computed(() => {
 });
 const coeditStudentSnapshot = computed(() => {
   if (!coeditStudentId.value) {
-    return createEmptyWhiteboardSnapshot();
+    return EMPTY_READONLY_SNAPSHOT;
   }
 
   return (
-    studentBoardSnapshots.get(coeditStudentId.value) ??
-    createEmptyWhiteboardSnapshot()
+    studentBoardSnapshots.get(coeditStudentId.value) ?? EMPTY_READONLY_SNAPSHOT
   );
 });
 const studentGalleryRef = ref<HTMLDivElement | null>(null);
@@ -1411,17 +1411,16 @@ function applyTeacherEventToStudentSnapshot(
   studentId: string,
   payload: WhiteboardIncrementalEventPayload,
 ) {
-  const baseSnapshot =
+  const snapshot =
     studentBoardSnapshots.get(studentId) ?? createEmptyWhiteboardSnapshot();
-  const nextSnapshot = cloneWhiteboardSnapshot(baseSnapshot);
 
-  applyIncrementalEvent(nextSnapshot, {
+  applyIncrementalEvent(snapshot, {
     ...payload,
     seq: -1,
     timestamp: Date.now(),
   });
 
-  setStudentSnapshot(studentId, nextSnapshot);
+  setStudentSnapshot(studentId, snapshot);
 }
 
 function enqueueTeacherToStudentIncrementalEvent(
@@ -1446,15 +1445,6 @@ function enqueueTeacherToStudentIncrementalEvent(
   }
 
   scheduleTeacherToStudentBatchFlush(studentId);
-}
-
-function handleCoeditStudentSnapshot(snapshot: WhiteboardSnapshot) {
-  const studentId = coeditStudentId.value;
-  if (!studentId) {
-    return;
-  }
-
-  setStudentSnapshot(studentId, snapshot);
 }
 
 function handleCoeditStudentSyncEvent(
@@ -1594,13 +1584,15 @@ function submitOpenStudentUrlCommand() {
   closeStudentUrlDialog();
 }
 
-function handleTeacherWhiteboardSnapshot(snapshot: WhiteboardSnapshot) {
-  teacherWhiteboardSnapshot.value = cloneWhiteboardSnapshot(snapshot);
-}
-
 function handleTeacherWhiteboardSyncEvent(
   payload: WhiteboardIncrementalEventPayload,
 ) {
+  applyIncrementalEvent(teacherWhiteboardSnapshot.value, {
+    ...payload,
+    seq: -1,
+    timestamp: Date.now(),
+  });
+
   if (payload.type === "background-change") {
     broadcastToLessonChannels(
       toTeacherBoardBackgroundMessage(
@@ -1669,7 +1661,7 @@ function applyIncrementalEvent(
 }
 
 function setStudentSnapshot(studentId: string, snapshot: WhiteboardSnapshot) {
-  studentBoardSnapshots.set(studentId, cloneWhiteboardSnapshot(snapshot));
+  studentBoardSnapshots.set(studentId, snapshot);
 }
 
 function resetStudentBoardState(studentId: string) {
@@ -1688,9 +1680,8 @@ function processStudentBatch(
   studentId: string,
   message: WhiteboardStudentEventBatchMessage,
 ) {
-  const baseSnapshot =
+  const nextSnapshot =
     studentBoardSnapshots.get(studentId) ?? createEmptyWhiteboardSnapshot();
-  const nextSnapshot = cloneWhiteboardSnapshot(baseSnapshot);
 
   for (const event of message.events) {
     applyIncrementalEvent(nextSnapshot, event);
@@ -2070,14 +2061,12 @@ function connectTeacherSocket() {
 
 watch(studentBackground, (nextBackground) => {
   for (const student of students.value) {
-    const currentSnapshot =
+    const snapshot =
       studentBoardSnapshots.get(student.connection_id) ??
       createEmptyWhiteboardSnapshot();
 
-    setStudentSnapshot(student.connection_id, {
-      ...cloneWhiteboardSnapshot(currentSnapshot),
-      backgroundImage: nextBackground ?? null,
-    });
+    snapshot.backgroundImage = nextBackground ?? null;
+    setStudentSnapshot(student.connection_id, snapshot);
   }
 
   broadcastToLessonChannels(toStudentBoardBackgroundMessage(nextBackground));
@@ -2386,7 +2375,6 @@ onBeforeUnmount(() => {
                   ref="teacherWhiteboardCanvasRef"
                   :snapshot="teacherWhiteboardSnapshot"
                   :background-image="teacherBackgroundImage"
-                  @update:snapshot="handleTeacherWhiteboardSnapshot"
                   @sync-event="handleTeacherWhiteboardSyncEvent"
                 />
               </div>
@@ -2945,7 +2933,6 @@ onBeforeUnmount(() => {
           <WhiteboardCanvas
             :title="coeditStudent?.nickname ?? '學生白板'"
             :snapshot="coeditStudentSnapshot"
-            @update:snapshot="handleCoeditStudentSnapshot"
             @sync-event="handleCoeditStudentSyncEvent"
           />
         </v-card-text>

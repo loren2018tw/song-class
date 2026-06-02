@@ -30,7 +30,6 @@ const props = withDefaults(
 );
 
 const emit = defineEmits<{
-  (event: "update:snapshot", snapshot: WhiteboardSnapshot): void;
   (event: "sync-event", payload: WhiteboardIncrementalEventPayload): void;
 }>();
 
@@ -176,6 +175,7 @@ function getFlattenedDrawingLayer() {
 
 defineExpose({
   getFlattenedDrawingLayer,
+  getSnapshot: () => cloneSnapshot(currentSnapshot.value),
 });
 
 function emitSyncEvent(payload: WhiteboardIncrementalEventPayload) {
@@ -351,10 +351,6 @@ function redrawAll() {
   redrawDrawingCanvas();
 }
 
-function emitSnapshot() {
-  emit("update:snapshot", cloneSnapshot(currentSnapshot.value));
-}
-
 function hasBackgroundChanged(
   previousSnapshot: WhiteboardSnapshot,
   nextSnapshot: WhiteboardSnapshot,
@@ -417,10 +413,7 @@ function syncLocalStateFromSnapshot(snapshot: WhiteboardSnapshot) {
   redrawDrawingCanvas();
 }
 
-function updateBackgroundImage(
-  imagePath: string | null | undefined,
-  shouldEmit: boolean,
-) {
+function updateBackgroundImage(imagePath: string | null | undefined) {
   currentSnapshot.value.backgroundImage =
     normalizeBackgroundInstruction(imagePath);
   void redrawBackgroundCanvas();
@@ -430,9 +423,6 @@ function updateBackgroundImage(
     backgroundColor:
       currentSnapshot.value.backgroundColor || WHITEBOARD_BACKGROUND_COLOR,
   });
-  if (shouldEmit) {
-    emitSnapshot();
-  }
 }
 
 function toCanvasPoint(event: PointerEvent): WhiteboardPoint | null {
@@ -461,7 +451,7 @@ function isTouchPointer(event: PointerEvent) {
   return event.pointerType === "touch";
 }
 
-function finishActiveStroke(shouldEmitSnapshot: boolean) {
+function finishActiveStroke() {
   if (!isDrawing.value) {
     return;
   }
@@ -476,9 +466,6 @@ function finishActiveStroke(shouldEmitSnapshot: boolean) {
 
   activeStroke.value = null;
   drawingPointerId.value = null;
-  if (shouldEmitSnapshot) {
-    emitSnapshot();
-  }
 }
 
 function appendPoint(point: WhiteboardPoint) {
@@ -505,7 +492,7 @@ function beginDrawing(event: PointerEvent) {
   if (isTouchPointer(event)) {
     activeTouchPointerIds.add(event.pointerId);
     if (activeTouchPointerIds.size > 1) {
-      finishActiveStroke(true);
+      finishActiveStroke();
       return;
     }
   }
@@ -603,7 +590,7 @@ function endDrawing(event: PointerEvent) {
   }
 
   event.preventDefault();
-  finishActiveStroke(true);
+  finishActiveStroke();
 }
 
 function selectPenColor(color: WhiteboardColor) {
@@ -615,7 +602,6 @@ function selectPenColor(color: WhiteboardColor) {
     color: currentColor.value,
     size: currentSize.value,
   });
-  emitSnapshot();
 }
 
 function selectBrushSize(size: number) {
@@ -632,7 +618,6 @@ function selectBrushSize(size: number) {
     color: currentColor.value,
     size: emittedSize,
   });
-  emitSnapshot();
 }
 
 function updateBrushSize(value: number) {
@@ -648,7 +633,6 @@ function activateEraser() {
     color: currentColor.value,
     size: currentSize.value + 10,
   });
-  emitSnapshot();
 }
 
 function clearCanvas() {
@@ -685,7 +669,7 @@ watch(
     if (backgroundImage === undefined) {
       return;
     }
-    updateBackgroundImage(backgroundImage, true);
+    updateBackgroundImage(backgroundImage);
   },
   { immediate: true },
 );
