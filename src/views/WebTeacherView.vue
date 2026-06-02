@@ -1661,7 +1661,11 @@ function applyIncrementalEvent(
 }
 
 function setStudentSnapshot(studentId: string, snapshot: WhiteboardSnapshot) {
-  studentBoardSnapshots.set(studentId, snapshot);
+  // WhiteboardCanvas 以 snapshot 參考變化觸發重繪，這裡只做淺層複製避免深拷貝成本。
+  studentBoardSnapshots.set(studentId, {
+    ...snapshot,
+    backgroundImage: snapshot.backgroundImage ?? null,
+  });
 }
 
 function resetStudentBoardState(studentId: string) {
