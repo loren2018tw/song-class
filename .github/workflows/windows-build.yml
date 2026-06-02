@@ -55,5 +55,5 @@ jobs:
           tagName: ${{ steps.date.outputs.TAG }}
           releaseName: ${{ steps.date.outputs.TAG }}
           releaseDraft: false
-          prerelease: false
+          prerelease: true
           args: --bundles nsis
