@@ -40,6 +40,7 @@ export interface QuickQaQuestion {
   closedAt: number | null;
   correctOption: QuickQaOption | null;
   answersByStudent: Record<string, QuickQaOption>;
+  autoAddPointsForCorrect?: boolean;
 }
 
 export interface QuickQaOptionStat {

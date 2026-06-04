@@ -98,6 +98,7 @@ const quickQaQuestionInput = ref("");
 const quickQaOptionInputs = reactive<Record<QuickQaOption, string>>(
   createEmptyQuickQaOptions(),
 );
+const quickQaAutoAddPoints = ref(false);
 const quickQaQuestion = ref<QuickQaQuestion | null>(null);
 const quickQaResultView = ref<"summary" | "details">("summary");
 const quickQaCloseDialogVisible = ref(false);
@@ -543,6 +544,32 @@ async function changeStudentPoints(pointId: string, delta: number) {
   } catch (error) {
     studentPointsById.set(pointId, current);
     showRtcError(`更新學生積分失敗: ${String(error)}`);
+  }
+}
+
+async function changeMultipleStudentPoints(studentIds: number[], delta: number) {
+  if (studentIds.length === 0) {
+    return;
+  }
+
+  const snapshot = new Map(studentPointsById);
+  for (const studentId of studentIds) {
+    const pointId = toStudentPointsId(studentId);
+    const current = studentPointsById.get(pointId) ?? 0;
+    studentPointsById.set(pointId, current + delta);
+  }
+
+  try {
+    await studentPointsApi("/api/student-points/adjust-multiple", {
+      student_ids: studentIds,
+      delta,
+    });
+  } catch (error) {
+    studentPointsById.clear();
+    for (const [id, points] of snapshot) {
+      studentPointsById.set(id, points);
+    }
+    showRtcError(`批次更新學生積分失敗: ${String(error)}`);
   }
 }
 
@@ -1486,6 +1513,7 @@ function publishQuickQaQuestion() {
     closedAt: null,
     correctOption: null,
     answersByStudent: {},
+    autoAddPointsForCorrect: quickQaAutoAddPoints.value,
   };
 
   quickQaResultView.value = "summary";
@@ -1502,6 +1530,7 @@ function clearQuickQaDraft() {
   for (const option of QUICK_QA_OPTIONS) {
     quickQaOptionInputs[option] = "";
   }
+  quickQaAutoAddPoints.value = false;
 }
 
 function resetQuickQaStageLeaderboard() {
@@ -1532,6 +1561,7 @@ function closeQuickQaQuestion(correctOptionChoice: QuickQaOption | "none") {
     correctOptionChoice === "none" ? null : correctOptionChoice;
   const finalAnswers = { ...quickQaQuestion.value.answersByStudent };
 
+  const correctStudentIds: number[] = [];
   if (correctOption) {
     for (const [studentId, selectedOption] of Object.entries(finalAnswers)) {
       if (selectedOption !== correctOption) {
@@ -1539,6 +1569,13 @@ function closeQuickQaQuestion(correctOptionChoice: QuickQaOption | "none") {
       }
       const currentScore = quickQaStageCorrectCounts.get(studentId) ?? 0;
       quickQaStageCorrectCounts.set(studentId, currentScore + 1);
+
+      if (quickQaQuestion.value.autoAddPointsForCorrect) {
+        const student = students.value.find((s) => s.connection_id === studentId);
+        if (student && typeof student.student_id === "number") {
+          correctStudentIds.push(student.student_id);
+        }
+      }
     }
   }
 
@@ -1551,6 +1588,10 @@ function closeQuickQaQuestion(correctOptionChoice: QuickQaOption | "none") {
   };
 
   broadcastToLessonChannels(toQuickQaStateMessage("close"));
+
+  if (correctStudentIds.length > 0) {
+    void changeMultipleStudentPoints(correctStudentIds, 1);
+  }
 }
 
 function optionBadgeColor(option: QuickQaOption): string {
@@ -3465,6 +3506,14 @@ onBeforeUnmount(() => {
                   placeholder="可留白，改用口頭敘述"
                 />
               </div>
+
+              <v-checkbox
+                v-model="quickQaAutoAddPoints"
+                label="答對自動積點 +1 分"
+                hide-details
+                density="comfortable"
+                :disabled="quickQaEditorLocked"
+              />
 
               <div class="d-flex align-center ga-3 mt-2">
                 <v-btn

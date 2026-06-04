@@ -517,7 +517,7 @@ function fromActiveModule(activeModule: ActiveModule): WhiteboardMode {
     case "teacher_screen_broadcast":
       return "teacher-broadcast";
     case "student_points":
-      return "student-points";
+      return "home";
   }
 }
 

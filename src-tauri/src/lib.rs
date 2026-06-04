@@ -259,6 +259,12 @@ struct UpdateStudentPointsRequest {
 }
 
 #[derive(Debug, Deserialize)]
+struct UpdateMultipleStudentPointsRequest {
+    student_ids: Vec<i64>,
+    delta: i64,
+}
+
+#[derive(Debug, Deserialize)]
 struct UpdateAllStudentPointsRequest {
     delta: i64,
 }
@@ -2057,6 +2063,68 @@ async fn adjust_student_points_handler(
     Ok(Json(payload))
 }
 
+async fn adjust_multiple_students_points_handler(
+    State(state): State<HttpState>,
+    Json(body): Json<UpdateMultipleStudentPointsRequest>,
+) -> Result<Json<ClassroomStatePayload>, (StatusCode, Json<Value>)> {
+    let runtime = state.runtime.clone();
+    let (db_path, classroom_id) = {
+        let guard = runtime.lock().await;
+        (guard.db_path.clone(), guard.current_classroom_id)
+    };
+
+    if body.student_ids.is_empty() {
+        let payload = build_classroom_state(&runtime)
+            .await
+            .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error))?;
+        return Ok(Json(payload));
+    }
+
+    {
+        let mut conn = Connection::open(db_path).map_err(|error| {
+            api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("開啟資料庫失敗: {error}"),
+            )
+        })?;
+
+        let tx = conn.transaction().map_err(|error| {
+            api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("開啟事務失敗: {error}"),
+            )
+        })?;
+
+        for student_id in &body.student_ids {
+            tx.execute(
+                "UPDATE students
+                 SET points = COALESCE(points, 0) + ?1
+                 WHERE id = ?2 AND classroom_id = ?3",
+                params![body.delta, student_id, classroom_id],
+            )
+            .map_err(|error| {
+                api_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("批次更新學生積分失敗: {error}"),
+                )
+            })?;
+        }
+
+        tx.commit().map_err(|error| {
+            api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("提交事務失敗: {error}"),
+            )
+        })?;
+    }
+
+    broadcast_classroom_state(&runtime).await;
+    let payload = build_classroom_state(&runtime)
+        .await
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error))?;
+    Ok(Json(payload))
+}
+
 async fn adjust_all_student_points_handler(
     State(state): State<HttpState>,
     Json(body): Json<UpdateAllStudentPointsRequest>,
@@ -2717,6 +2785,10 @@ async fn start_server_impl(
         .route(
             "/api/student-points/adjust-student",
             post(adjust_student_points_handler),
+        )
+        .route(
+            "/api/student-points/adjust-multiple",
+            post(adjust_multiple_students_points_handler),
         )
         .route(
             "/api/student-points/adjust-all",
