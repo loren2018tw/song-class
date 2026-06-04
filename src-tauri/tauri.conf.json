@@ -44,7 +44,7 @@
     },
     "windows": {
       "nsis": {
-        "installerHooks": "packaging/windows/nsis-hooks.nsh"
+        "template": "packaging/windows/installer-custom.nsi"
       }
     }
   }

@@ -26,6 +26,21 @@ use uuid::Uuid;
 
 const DEFAULT_PORT: u16 = 17860;
 const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
+include!(concat!(env!("OUT_DIR"), "/generated_migrations.rs"));
+
+fn latest_schema_version() -> i32 {
+    GENERATED_MIGRATIONS
+        .last()
+        .map(|(version, _)| *version)
+        .unwrap_or(0)
+}
+
+fn baseline_migration() -> Result<(i32, &'static str), String> {
+    GENERATED_MIGRATIONS
+        .first()
+        .map(|(version, sql)| (*version, *sql))
+        .ok_or_else(|| "找不到任何可用的 migration 檔案".to_string())
+}
 
 fn resolve_app_version(app: &tauri::App) -> String {
     app.config()
@@ -460,14 +475,76 @@ fn normalize_seat_no_text(raw: &str) -> String {
     raw.trim().to_string()
 }
 
+fn read_user_version(conn: &Connection) -> Result<i32, String> {
+    conn.query_row("PRAGMA user_version", [], |row| row.get(0))
+        .map_err(|error| format!("讀取資料庫版本失敗: {error}"))
+}
+
+fn write_user_version(conn: &Connection, version: i32) -> Result<(), String> {
+    conn.pragma_update(None, "user_version", version)
+        .map_err(|error| format!("寫入資料庫版本失敗: {error}"))
+}
+
+fn has_legacy_v0_schema(conn: &Connection) -> Result<bool, String> {
+    let sql = "
+        SELECT COUNT(1)
+        FROM sqlite_master
+        WHERE type = 'table'
+          AND name IN ('classrooms', 'students', 'tasks', 'task_submissions')
+    ";
+    let table_count: i64 = conn
+        .query_row(sql, [], |row| row.get(0))
+        .map_err(|error| format!("檢查資料表結構失敗: {error}"))?;
+    Ok(table_count > 0)
+}
+
+fn apply_pending_migrations(conn: &Connection, current_version: i32) -> Result<(), String> {
+    let latest_version = latest_schema_version();
+    if current_version > latest_version {
+        return Err(format!(
+            "資料庫版本 ({current_version}) 高於目前程式支援版本 ({latest_version})"
+        ));
+    }
+
+    for (version, sql) in GENERATED_MIGRATIONS {
+        if *version > current_version {
+            conn.execute_batch(sql)
+                .map_err(|error| format!("套用 migration v{version} 失敗: {error}"))?;
+            write_user_version(conn, *version)?;
+        }
+    }
+
+    Ok(())
+}
+
 fn init_database(db_path: &PathBuf) -> Result<i64, String> {
     if let Some(parent) = db_path.parent() {
         fs::create_dir_all(parent).map_err(|error| format!("建立資料庫目錄失敗: {error}"))?;
     }
 
+    let is_new_database = !db_path.exists();
     let mut conn = Connection::open(db_path).map_err(|error| format!("開啟資料庫失敗: {error}"))?;
-    conn.execute_batch(include_str!("../sql/v0.sql"))
-        .map_err(|error| format!("套用 DDL 失敗: {error}"))?;
+    let (baseline_version, baseline_sql) = baseline_migration()?;
+
+    if is_new_database {
+        conn.execute_batch(baseline_sql)
+            .map_err(|error| format!("套用 DDL 失敗: {error}"))?;
+        write_user_version(&conn, baseline_version)?;
+    } else {
+        let user_version = read_user_version(&conn)?;
+        if user_version == 0 {
+            if has_legacy_v0_schema(&conn)? {
+                write_user_version(&conn, baseline_version)?;
+            } else {
+                conn.execute_batch(baseline_sql)
+                    .map_err(|error| format!("套用 DDL 失敗: {error}"))?;
+                write_user_version(&conn, baseline_version)?;
+            }
+        }
+    }
+
+    let current_version = read_user_version(&conn)?;
+    apply_pending_migrations(&conn, current_version)?;
 
     let classroom_count: i64 = conn
         .query_row("SELECT COUNT(1) FROM classrooms", [], |row| row.get(0))
@@ -2771,6 +2848,55 @@ mod tests {
             duplicated_seat_count, 0,
             "seat numbers should remain unique"
         );
+
+        let _ = fs::remove_file(db_path);
+    }
+
+    #[test]
+    fn init_database_sets_schema_version_to_latest() {
+        let db_path = make_temp_db_path();
+
+        init_database(&db_path).expect("init should set schema version");
+
+        let conn = Connection::open(&db_path).expect("open sqlite database");
+        let user_version: i64 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .expect("query user_version");
+        assert_eq!(
+            user_version,
+            latest_schema_version() as i64,
+            "schema version should match latest"
+        );
+
+        let _ = fs::remove_file(db_path);
+    }
+
+    #[test]
+    fn init_database_adopts_legacy_schema_without_reseeding() {
+        let db_path = make_temp_db_path();
+        let conn = Connection::open(&db_path).expect("open sqlite database");
+        let (_, baseline_sql) = baseline_migration().expect("read baseline migration");
+        conn.execute_batch(baseline_sql)
+            .expect("apply legacy v0 sql");
+        conn.execute(
+            "INSERT INTO classrooms (name) VALUES (?1)",
+            params!["既有班級"],
+        )
+        .expect("insert legacy classroom");
+        drop(conn);
+
+        init_database(&db_path).expect("init should adopt legacy schema");
+
+        let conn = Connection::open(&db_path).expect("open sqlite database");
+        let user_version: i64 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .expect("query user_version");
+        assert_eq!(user_version, latest_schema_version() as i64);
+
+        let class_count: i64 = conn
+            .query_row("SELECT COUNT(1) FROM classrooms", [], |row| row.get(0))
+            .expect("query classroom count");
+        assert_eq!(class_count, 1, "should not reseed existing classrooms");
 
         let _ = fs::remove_file(db_path);
     }
