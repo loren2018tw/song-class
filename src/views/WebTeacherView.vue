@@ -101,6 +101,8 @@ const whiteboardDiagAvgTransportLagMs = ref(0);
 const whiteboardDiagMaxTransportLagMs = ref(0);
 const whiteboardDiagAvgBatchProcessMs = ref(0);
 const whiteboardDiagMaxBatchProcessMs = ref(0);
+const whiteboardDiagAvgCanvasDrawMs = ref(0);
+const whiteboardDiagMaxCanvasDrawMs = ref(0);
 const whiteboardDiagDroppedStrokePoints = ref(0);
 const whiteboardDiagLastBatchAt = ref<number | null>(null);
 
@@ -117,6 +119,8 @@ const studentBackground = ref<string | null>(null);
 const downloadingStudentBoardsPdf = ref(false);
 
 type WhiteboardCanvasExposed = {
+  applyIncrementalEvents: (events: WhiteboardIncrementalEvent[]) => void;
+  getSnapshot: () => WhiteboardSnapshot;
   getFlattenedDrawingLayer: () => {
     imageDataUrl: string;
     width: number;
@@ -126,6 +130,9 @@ type WhiteboardCanvasExposed = {
 };
 
 const teacherWhiteboardCanvasRef = ref<WhiteboardCanvasExposed | null>(null);
+const studentBoardCanvasRefs = reactive(
+  new Map<string, WhiteboardCanvasExposed>(),
+);
 
 const teacherWhiteboardSnapshot = ref<WhiteboardSnapshot>(
   createEmptyWhiteboardSnapshot(),
@@ -160,6 +167,8 @@ let whiteboardDiagTransportLagTotalMs = 0;
 let whiteboardDiagTransportLagCount = 0;
 let whiteboardDiagBatchProcessTotalMs = 0;
 let whiteboardDiagBatchProcessCount = 0;
+let whiteboardDiagCanvasDrawTotalMs = 0;
+let whiteboardDiagCanvasDrawCount = 0;
 let whiteboardDiagTickTimer: number | null = null;
 
 const BATCH_INTERVAL_MS = 33;
@@ -223,6 +232,30 @@ function recordStudentBatchProcessDuration(durationMs: number) {
   );
 }
 
+function recordStudentCanvasDrawDuration(durationMs: number) {
+  whiteboardDiagCanvasDrawTotalMs += durationMs;
+  whiteboardDiagCanvasDrawCount += 1;
+  whiteboardDiagAvgCanvasDrawMs.value =
+    whiteboardDiagCanvasDrawTotalMs / whiteboardDiagCanvasDrawCount;
+  whiteboardDiagMaxCanvasDrawMs.value = Math.max(
+    whiteboardDiagMaxCanvasDrawMs.value,
+    durationMs,
+  );
+}
+
+function bindStudentBoardCanvasRef(studentId: string, instance: unknown) {
+  if (
+    instance &&
+    typeof (instance as WhiteboardCanvasExposed).applyIncrementalEvents ===
+      "function"
+  ) {
+    studentBoardCanvasRefs.set(studentId, instance as WhiteboardCanvasExposed);
+    return;
+  }
+
+  studentBoardCanvasRefs.delete(studentId);
+}
+
 function resetWhiteboardDiagnostics() {
   whiteboardDiagWindowEvents = 0;
   whiteboardDiagWindowBatches = 0;
@@ -230,6 +263,8 @@ function resetWhiteboardDiagnostics() {
   whiteboardDiagTransportLagCount = 0;
   whiteboardDiagBatchProcessTotalMs = 0;
   whiteboardDiagBatchProcessCount = 0;
+  whiteboardDiagCanvasDrawTotalMs = 0;
+  whiteboardDiagCanvasDrawCount = 0;
 
   whiteboardDiagEventsPerSecond.value = 0;
   whiteboardDiagBatchesPerSecond.value = 0;
@@ -239,6 +274,8 @@ function resetWhiteboardDiagnostics() {
   whiteboardDiagMaxTransportLagMs.value = 0;
   whiteboardDiagAvgBatchProcessMs.value = 0;
   whiteboardDiagMaxBatchProcessMs.value = 0;
+  whiteboardDiagAvgCanvasDrawMs.value = 0;
+  whiteboardDiagMaxCanvasDrawMs.value = 0;
   whiteboardDiagDroppedStrokePoints.value = 0;
   whiteboardDiagLastBatchAt.value = null;
 }
@@ -1782,14 +1819,32 @@ function processStudentBatch(
   message: WhiteboardStudentEventBatchMessage,
 ) {
   const processStartedAt = performance.now();
-  const nextSnapshot =
-    studentBoardSnapshots.get(studentId) ?? createEmptyWhiteboardSnapshot();
+  const existingSnapshot = studentBoardSnapshots.get(studentId);
+  const nextSnapshot = existingSnapshot ?? createEmptyWhiteboardSnapshot();
+
+  if (!existingSnapshot) {
+    setStudentSnapshot(studentId, nextSnapshot);
+  }
 
   for (const event of message.events) {
     applyIncrementalEvent(nextSnapshot, event);
   }
 
-  setStudentSnapshot(studentId, nextSnapshot);
+  const drawStartedAt = performance.now();
+  const canvas = studentBoardCanvasRefs.get(studentId);
+  if (canvas) {
+    canvas.applyIncrementalEvents(message.events);
+  } else {
+    // 尚未掛載縮圖元件時，才用 snapshot 更新作為後備。
+    setStudentSnapshot(studentId, nextSnapshot);
+  }
+
+  if (coeditStudentId.value === studentId) {
+    setStudentSnapshot(studentId, nextSnapshot);
+  }
+
+  recordStudentCanvasDrawDuration(performance.now() - drawStartedAt);
+
   studentBoardLastSequence.set(studentId, message.endSeq);
   recordStudentBatchProcessDuration(performance.now() - processStartedAt);
 }
@@ -2020,6 +2075,7 @@ function disposeStudentConnection(studentId: string) {
   teacherBroadcastSenders.delete(studentId);
   studentFocusStatusById.delete(studentId);
   studentFocusUpdatedAtById.delete(studentId);
+  studentBoardCanvasRefs.delete(studentId);
   studentBoardSnapshots.delete(studentId);
   studentBoardLastSequence.delete(studentId);
   teacherToStudentLastSequence.delete(studentId);
@@ -2245,6 +2301,7 @@ onBeforeUnmount(() => {
   teacherToStudentLastSequence.clear();
   teacherToStudentNextSequence.clear();
   queuedTeacherToStudentEvents.clear();
+  studentBoardCanvasRefs.clear();
 
   if (studentGalleryResizeObserver) {
     studentGalleryResizeObserver.disconnect();
@@ -2505,6 +2562,10 @@ onBeforeUnmount(() => {
                     @keydown.space.prevent="openStudentCoeditDialog(tile.id)"
                   >
                     <WhiteboardCanvas
+                      :ref="
+                        (instance) =>
+                          bindStudentBoardCanvasRef(tile.id, instance)
+                      "
                       :title="tile.nickname"
                       :snapshot="tile.snapshot"
                       :show-toolbar="false"
@@ -2621,14 +2682,22 @@ onBeforeUnmount(() => {
                       總事件: {{ whiteboardDiagTotalEvents }}
                     </div>
                     <div class="diag-line">
-                      傳輸延遲 Avg/Max:
+                      事件時間差 Avg/Max:
                       {{ whiteboardDiagAvgTransportLagMs.toFixed(1) }} /
                       {{ whiteboardDiagMaxTransportLagMs.toFixed(1) }} ms
                     </div>
                     <div class="diag-line">
-                      批次耗時 Avg/Max:
+                      * 事件時間差會受學生裝置時鐘誤差影響
+                    </div>
+                    <div class="diag-line">
+                      批次總耗時 Avg/Max:
                       {{ whiteboardDiagAvgBatchProcessMs.toFixed(2) }} /
                       {{ whiteboardDiagMaxBatchProcessMs.toFixed(2) }} ms
+                    </div>
+                    <div class="diag-line">
+                      Canvas繪製 Avg/Max:
+                      {{ whiteboardDiagAvgCanvasDrawMs.toFixed(2) }} /
+                      {{ whiteboardDiagMaxCanvasDrawMs.toFixed(2) }} ms
                     </div>
                     <div class="diag-line">
                       掉點次數: {{ whiteboardDiagDroppedStrokePoints }}

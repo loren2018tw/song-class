@@ -9,6 +9,7 @@ import {
   WHITEBOARD_CANVAS_WIDTH,
   WHITEBOARD_COLOR_OPTIONS,
   type WhiteboardColor,
+  type WhiteboardIncrementalEvent,
   type WhiteboardIncrementalEventPayload,
   type WhiteboardPoint,
   type WhiteboardSnapshot,
@@ -176,6 +177,7 @@ function getFlattenedDrawingLayer() {
 defineExpose({
   getFlattenedDrawingLayer,
   getSnapshot: () => cloneSnapshot(currentSnapshot.value),
+  applyIncrementalEvents,
 });
 
 function emitSyncEvent(payload: WhiteboardIncrementalEventPayload) {
@@ -294,6 +296,26 @@ function drawStroke(
   context.restore();
 }
 
+function drawStrokeSegment(
+  context: CanvasRenderingContext2D,
+  stroke: WhiteboardStroke,
+  from: WhiteboardPoint,
+  to: WhiteboardPoint,
+) {
+  context.save();
+  context.globalCompositeOperation =
+    stroke.tool === "eraser" ? "destination-out" : "source-over";
+  context.strokeStyle = stroke.color;
+  context.fillStyle = stroke.color;
+  context.lineWidth = stroke.size;
+
+  context.beginPath();
+  context.moveTo(from.x, from.y);
+  context.lineTo(to.x, to.y);
+  context.stroke();
+  context.restore();
+}
+
 function redrawDrawingCanvas() {
   const context = getCanvasContext(drawingCanvasRef.value);
   if (!context) {
@@ -304,6 +326,91 @@ function redrawDrawingCanvas() {
   for (const stroke of currentSnapshot.value.strokes) {
     drawStroke(context, stroke);
   }
+}
+
+function applyIncrementalEventWithoutEmit(
+  event: WhiteboardIncrementalEvent,
+  drawingContext: CanvasRenderingContext2D | null,
+) {
+  switch (event.type) {
+    case "stroke-begin": {
+      const exists = currentSnapshot.value.strokes.some(
+        (stroke) => stroke.id === event.stroke.id,
+      );
+      if (exists) {
+        break;
+      }
+
+      const nextStroke = cloneWhiteboardStroke(event.stroke);
+      currentSnapshot.value.strokes.push(nextStroke);
+      if (drawingContext) {
+        drawStroke(drawingContext, nextStroke);
+      }
+      break;
+    }
+    case "stroke-point": {
+      const stroke =
+        currentSnapshot.value.strokes.find(
+          (candidate) => candidate.id === event.strokeId,
+        ) ?? null;
+      if (!stroke) {
+        break;
+      }
+
+      const previousPoint = stroke.points[stroke.points.length - 1] ?? null;
+      const nextPoint = { x: event.point.x, y: event.point.y };
+      stroke.points.push(nextPoint);
+
+      if (!drawingContext) {
+        break;
+      }
+
+      if (!previousPoint) {
+        drawStroke(drawingContext, stroke);
+        break;
+      }
+
+      drawStrokeSegment(drawingContext, stroke, previousPoint, nextPoint);
+      break;
+    }
+    case "stroke-end": {
+      break;
+    }
+    case "clear": {
+      currentSnapshot.value.strokes = [];
+      if (drawingContext) {
+        drawingContext.clearRect(
+          0,
+          0,
+          WHITEBOARD_CANVAS_WIDTH,
+          WHITEBOARD_CANVAS_HEIGHT,
+        );
+      }
+      break;
+    }
+    case "background-change": {
+      currentSnapshot.value.backgroundImage = event.backgroundImage ?? null;
+      currentSnapshot.value.backgroundColor = event.backgroundColor;
+      void redrawBackgroundCanvas();
+      break;
+    }
+    case "tool-change": {
+      break;
+    }
+  }
+}
+
+function applyIncrementalEvents(events: WhiteboardIncrementalEvent[]) {
+  if (events.length === 0) {
+    return;
+  }
+
+  const drawingContext = getCanvasContext(drawingCanvasRef.value);
+  for (const event of events) {
+    applyIncrementalEventWithoutEmit(event, drawingContext);
+  }
+
+  markDrawingLayerDirty();
 }
 
 async function redrawBackgroundCanvas() {

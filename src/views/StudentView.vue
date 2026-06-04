@@ -42,6 +42,9 @@ const { appVersionLabel } = useAppVersion(props.baseUrl);
 const STUDENT_BATCH_INTERVAL_MS = 33;
 const STUDENT_BATCH_MAX_EVENTS = 24;
 const STUDENT_FOCUS_STATUS_DEBOUNCE_MS = 250;
+const LESSON_SEND_HIGH_WATERMARK_BYTES = 512 * 1024;
+const LESSON_SEND_LOW_WATERMARK_BYTES = 128 * 1024;
+const LESSON_SEND_DRAIN_BUDGET_BYTES = 64 * 1024;
 
 const statusText = ref("尚未連線");
 const isConnected = ref(false);
@@ -76,6 +79,9 @@ let classroomPollTimer: number | null = null;
 let ws: WebSocket | null = null;
 let peer: RTCPeerConnection | null = null;
 let lessonChannel: RTCDataChannel | null = null;
+const queuedLessonMessages: string[] = [];
+let queuedLessonBytes = 0;
+let lessonDrainTimer: number | null = null;
 let selfId: string | undefined;
 let teacherId: string | undefined;
 let pendingJoinSelection: { classroomId: number; seatNoText: string } | null =
@@ -124,6 +130,7 @@ const hasJoinedClassroom = computed(() => joinedSessionId.value !== null);
 
 function disposePeerConnection() {
   if (lessonChannel) {
+    lessonChannel.onbufferedamountlow = null;
     lessonChannel.onopen = null;
     lessonChannel.onmessage = null;
     lessonChannel.onclose = null;
@@ -137,6 +144,7 @@ function disposePeerConnection() {
     peer = null;
   }
 
+  resetLessonSendQueue();
   queuedIceCandidates.length = 0;
 }
 
@@ -269,11 +277,76 @@ function sendSignal(payload: SignalEnvelope) {
   }
 }
 
+function estimateMessageBytes(raw: string) {
+  // WebRTC DataChannel 文字訊息以 UTF-8 傳輸；以保守估算控制排程即可。
+  return Math.max(1, raw.length * 2);
+}
+
+function stopLessonDrainTimer() {
+  if (lessonDrainTimer !== null) {
+    window.clearTimeout(lessonDrainTimer);
+    lessonDrainTimer = null;
+  }
+}
+
+function resetLessonSendQueue() {
+  stopLessonDrainTimer();
+  queuedLessonMessages.length = 0;
+  queuedLessonBytes = 0;
+}
+
+function scheduleLessonDrain(delayMs = 0) {
+  if (lessonDrainTimer !== null) {
+    return;
+  }
+
+  lessonDrainTimer = window.setTimeout(() => {
+    lessonDrainTimer = null;
+    drainLessonMessages();
+  }, delayMs);
+}
+
+function drainLessonMessages() {
+  const channel = lessonChannel;
+  if (!channel || channel.readyState !== "open") {
+    return;
+  }
+
+  let sentBytes = 0;
+  while (queuedLessonMessages.length > 0) {
+    if (channel.bufferedAmount >= LESSON_SEND_HIGH_WATERMARK_BYTES) {
+      return;
+    }
+
+    const raw = queuedLessonMessages.shift();
+    if (raw === undefined) {
+      break;
+    }
+
+    const bytes = estimateMessageBytes(raw);
+    queuedLessonBytes = Math.max(0, queuedLessonBytes - bytes);
+    channel.send(raw);
+    sentBytes += bytes;
+
+    if (sentBytes >= LESSON_SEND_DRAIN_BUDGET_BYTES) {
+      break;
+    }
+  }
+
+  if (queuedLessonMessages.length > 0) {
+    scheduleLessonDrain(8);
+  }
+}
+
 function sendLessonMessage(message: WhiteboardSyncMessage) {
   if (!lessonChannel || lessonChannel.readyState !== "open") {
     return;
   }
-  lessonChannel.send(JSON.stringify(message));
+
+  const raw = JSON.stringify(message);
+  queuedLessonMessages.push(raw);
+  queuedLessonBytes += estimateMessageBytes(raw);
+  drainLessonMessages();
 }
 
 function stopFocusStatusDebounceTimer() {
@@ -450,6 +523,7 @@ function resetToJoinState(message = "連線已中斷，請重新加入") {
   studentNextSequence = 1;
   teacherStudentLastAppliedSequence.value = 0;
   queuedStudentEvents.length = 0;
+  resetLessonSendQueue();
   stopStudentBatchTimer();
   stopFocusStatusDebounceTimer();
   pendingFocusStatus = null;
@@ -940,14 +1014,20 @@ function handleLessonMessage(raw: string) {
 
 function bindLessonChannel(channel: RTCDataChannel) {
   lessonChannel = channel;
+  lessonChannel.bufferedAmountLowThreshold = LESSON_SEND_LOW_WATERMARK_BYTES;
 
   lessonChannel.onopen = () => {
     isConnected.value = true;
     isJoinRequested.value = false;
     statusText.value = "已連線，請專心學習";
     signalError.value = "";
+    drainLessonMessages();
     requestTeacherSnapshot("join-init");
     queueFocusStatus(resolveCurrentFocusStatus(), true);
+  };
+
+  lessonChannel.onbufferedamountlow = () => {
+    drainLessonMessages();
   };
 
   lessonChannel.onmessage = (event) => {
@@ -959,6 +1039,7 @@ function bindLessonChannel(channel: RTCDataChannel) {
   };
 
   lessonChannel.onclose = () => {
+    resetLessonSendQueue();
     handleLessonTransportInterrupted("教師端連線中斷，等待重新連線...");
   };
 
@@ -1110,6 +1191,7 @@ onBeforeUnmount(() => {
   document.removeEventListener("visibilitychange", handleVisibilityChange);
   stopClassroomPollTimer();
 
+  resetLessonSendQueue();
   stopStudentBatchTimer();
   stopFocusStatusDebounceTimer();
   closeSignalSocket();
