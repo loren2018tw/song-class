@@ -47,6 +47,7 @@ import {
   type WhiteboardStudentBoardControlMessage,
   type WhiteboardStudentSwitchBoardMessage,
   type WhiteboardStudentEventBatchMessage,
+  type WhiteboardTeacherStudentSnapshotMessage,
   type WhiteboardTeacherStudentEventBatchMessage,
   type WhiteboardStudentViewControlMessage,
   type WhiteboardSyncMessage,
@@ -1945,6 +1946,22 @@ function handleChannelMessage(studentId: string, raw: string) {
         return;
       }
 
+      return;
+    }
+
+    if (parsed.kind === "teacher-student-snapshot") {
+      const message = parsed as WhiteboardTeacherStudentSnapshotMessage;
+      if (message.boardTab !== "student-board") {
+        return;
+      }
+
+      const currentSnapshot =
+        studentBoardSnapshots.get(studentId) ?? createEmptyWhiteboardSnapshot();
+      const snapshot = cloneWhiteboardSnapshot(message.snapshot);
+      snapshot.backgroundImage = currentSnapshot.backgroundImage ?? null;
+      snapshot.backgroundColor = currentSnapshot.backgroundColor;
+      setStudentSnapshot(studentId, snapshot);
+      studentBoardLastSequence.set(studentId, Math.max(0, message.seq));
       return;
     }
 

@@ -28,6 +28,7 @@ import {
   type WhiteboardSnapshotRequestMessage,
   type StudentFocusStatusMessage,
   type WhiteboardStudentEventBatchMessage,
+  type WhiteboardTeacherStudentSnapshotMessage,
   type WhiteboardTeacherStudentEventBatchMessage,
   type WhiteboardSyncMessage,
   type WhiteboardTeacherBoardControlMessage,
@@ -42,9 +43,27 @@ const { appVersionLabel } = useAppVersion(props.baseUrl);
 const STUDENT_BATCH_INTERVAL_MS = 33;
 const STUDENT_BATCH_MAX_EVENTS = 24;
 const STUDENT_FOCUS_STATUS_DEBOUNCE_MS = 250;
+const STUDENT_AUTO_REJOIN_TTL_MS = 12 * 60 * 60 * 1000;
+const STUDENT_AUTO_RECONNECT_DELAY_MS = 1200;
+const STUDENT_REJOIN_STORAGE_KEY = "song-class.student.rejoin";
+const STUDENT_BOARD_SNAPSHOT_STORAGE_KEY = "song-class.student.board-snapshot";
+const STUDENT_BOARD_SNAPSHOT_TTL_MS = 12 * 60 * 60 * 1000;
 const LESSON_SEND_HIGH_WATERMARK_BYTES = 512 * 1024;
 const LESSON_SEND_LOW_WATERMARK_BYTES = 128 * 1024;
 const LESSON_SEND_DRAIN_BUDGET_BYTES = 64 * 1024;
+
+type PersistedStudentRejoinState = {
+  classroomId: number;
+  seatNoText: string;
+  expiresAt: number;
+};
+
+type PersistedStudentBoardSnapshotState = {
+  classroomId: number;
+  seatNoText: string;
+  snapshot: WhiteboardSnapshot;
+  expiresAt: number;
+};
 
 const statusText = ref("尚未連線");
 const isConnected = ref(false);
@@ -89,6 +108,9 @@ let pendingJoinSelection: { classroomId: number; seatNoText: string } | null =
 const queuedIceCandidates: RTCIceCandidateInit[] = [];
 const isJoinRequested = ref(false);
 const joinedSessionId = ref<string | null>(null);
+const joinedClassroomId = ref<number | null>(null);
+const joinedSeatNoText = ref("");
+let reconnectTimer: number | null = null;
 
 const wsUrl = computed(() => {
   const base = new URL(props.baseUrl);
@@ -126,7 +148,296 @@ const quickQaFeedback = computed(() => {
 const quickQaAnswerDisabled = computed(
   () => !quickQaQuestion.value || quickQaQuestion.value.status !== "open",
 );
-const hasJoinedClassroom = computed(() => joinedSessionId.value !== null);
+const hasJoinedClassroom = computed(
+  () =>
+    joinedClassroomId.value !== null &&
+    joinedSeatNoText.value.trim().length > 0,
+);
+
+function stopReconnectTimer() {
+  if (reconnectTimer !== null) {
+    window.clearTimeout(reconnectTimer);
+    reconnectTimer = null;
+  }
+}
+
+function clearPersistedJoinState() {
+  try {
+    window.localStorage.removeItem(STUDENT_REJOIN_STORAGE_KEY);
+  } catch {
+    // Ignore storage write failures.
+  }
+}
+
+function clearPersistedStudentBoardSnapshot() {
+  try {
+    window.localStorage.removeItem(STUDENT_BOARD_SNAPSHOT_STORAGE_KEY);
+  } catch {
+    // Ignore storage write failures.
+  }
+}
+
+function readPersistedJoinState(): PersistedStudentRejoinState | null {
+  try {
+    const raw = window.localStorage.getItem(STUDENT_REJOIN_STORAGE_KEY);
+    if (!raw) {
+      return null;
+    }
+
+    const parsed = JSON.parse(raw) as Partial<PersistedStudentRejoinState>;
+    if (
+      typeof parsed.classroomId !== "number" ||
+      !Number.isFinite(parsed.classroomId) ||
+      parsed.classroomId <= 0
+    ) {
+      clearPersistedJoinState();
+      return null;
+    }
+
+    if (typeof parsed.seatNoText !== "string" || !parsed.seatNoText.trim()) {
+      clearPersistedJoinState();
+      return null;
+    }
+
+    if (
+      typeof parsed.expiresAt !== "number" ||
+      !Number.isFinite(parsed.expiresAt) ||
+      parsed.expiresAt <= Date.now()
+    ) {
+      clearPersistedJoinState();
+      return null;
+    }
+
+    return {
+      classroomId: parsed.classroomId,
+      seatNoText: parsed.seatNoText,
+      expiresAt: parsed.expiresAt,
+    };
+  } catch {
+    clearPersistedJoinState();
+    return null;
+  }
+}
+
+function persistJoinState(classroomId: number, seatNoText: string) {
+  const normalizedSeatNoText = seatNoText.trim();
+  if (!normalizedSeatNoText) {
+    clearPersistedJoinState();
+    return;
+  }
+
+  const state: PersistedStudentRejoinState = {
+    classroomId,
+    seatNoText: normalizedSeatNoText,
+    expiresAt: Date.now() + STUDENT_AUTO_REJOIN_TTL_MS,
+  };
+
+  try {
+    window.localStorage.setItem(
+      STUDENT_REJOIN_STORAGE_KEY,
+      JSON.stringify(state),
+    );
+  } catch {
+    // Ignore storage write failures.
+  }
+}
+
+function persistStudentBoardSnapshot() {
+  if (joinedClassroomId.value === null) {
+    clearPersistedStudentBoardSnapshot();
+    return;
+  }
+
+  const seatNoText = joinedSeatNoText.value.trim();
+  if (!seatNoText) {
+    clearPersistedStudentBoardSnapshot();
+    return;
+  }
+
+  const state: PersistedStudentBoardSnapshotState = {
+    classroomId: joinedClassroomId.value,
+    seatNoText,
+    snapshot: cloneWhiteboardSnapshot(studentSnapshot.value),
+    expiresAt: Date.now() + STUDENT_BOARD_SNAPSHOT_TTL_MS,
+  };
+
+  try {
+    window.localStorage.setItem(
+      STUDENT_BOARD_SNAPSHOT_STORAGE_KEY,
+      JSON.stringify(state),
+    );
+  } catch {
+    // Ignore storage write failures.
+  }
+}
+
+function readPersistedStudentBoardSnapshot(): PersistedStudentBoardSnapshotState | null {
+  try {
+    const raw = window.localStorage.getItem(STUDENT_BOARD_SNAPSHOT_STORAGE_KEY);
+    if (!raw) {
+      return null;
+    }
+
+    const parsed = JSON.parse(
+      raw,
+    ) as Partial<PersistedStudentBoardSnapshotState>;
+    if (
+      typeof parsed.classroomId !== "number" ||
+      !Number.isFinite(parsed.classroomId) ||
+      parsed.classroomId <= 0
+    ) {
+      clearPersistedStudentBoardSnapshot();
+      return null;
+    }
+
+    if (typeof parsed.seatNoText !== "string" || !parsed.seatNoText.trim()) {
+      clearPersistedStudentBoardSnapshot();
+      return null;
+    }
+
+    if (
+      typeof parsed.expiresAt !== "number" ||
+      !Number.isFinite(parsed.expiresAt) ||
+      parsed.expiresAt <= Date.now()
+    ) {
+      clearPersistedStudentBoardSnapshot();
+      return null;
+    }
+
+    const snapshot = parsed.snapshot;
+    if (!snapshot || typeof snapshot !== "object") {
+      clearPersistedStudentBoardSnapshot();
+      return null;
+    }
+
+    return {
+      classroomId: parsed.classroomId,
+      seatNoText: parsed.seatNoText,
+      snapshot: snapshot as WhiteboardSnapshot,
+      expiresAt: parsed.expiresAt,
+    };
+  } catch {
+    clearPersistedStudentBoardSnapshot();
+    return null;
+  }
+}
+
+function restorePersistedStudentBoardSnapshot() {
+  const persisted = readPersistedStudentBoardSnapshot();
+  if (!persisted) {
+    return;
+  }
+
+  if (
+    joinedClassroomId.value === null ||
+    joinedClassroomId.value !== persisted.classroomId ||
+    joinedSeatNoText.value.trim() !== persisted.seatNoText.trim()
+  ) {
+    return;
+  }
+
+  studentSnapshot.value = cloneWhiteboardSnapshot(persisted.snapshot);
+}
+
+function markJoinedSelection(classroomId: number, seatNoText: string) {
+  const normalizedSeatNoText = seatNoText.trim();
+  joinedClassroomId.value = classroomId;
+  joinedSeatNoText.value = normalizedSeatNoText;
+  persistJoinState(classroomId, normalizedSeatNoText);
+}
+
+function clearJoinedSelection() {
+  joinedClassroomId.value = null;
+  joinedSeatNoText.value = "";
+}
+
+function getActiveJoinSelection() {
+  if (joinedClassroomId.value !== null && joinedSeatNoText.value.trim()) {
+    return {
+      classroomId: joinedClassroomId.value,
+      seatNoText: joinedSeatNoText.value.trim(),
+    };
+  }
+
+  const persisted = readPersistedJoinState();
+  if (!persisted) {
+    return null;
+  }
+
+  markJoinedSelection(persisted.classroomId, persisted.seatNoText);
+  return {
+    classroomId: persisted.classroomId,
+    seatNoText: persisted.seatNoText,
+  };
+}
+
+function queueJoinRequest(
+  selection: { classroomId: number; seatNoText: string },
+  pendingStatus = "連線建立中，準備送出加入請求...",
+) {
+  ensureSocket();
+
+  if (
+    isJoinRequested.value &&
+    pendingJoinSelection?.classroomId === selection.classroomId &&
+    pendingJoinSelection?.seatNoText === selection.seatNoText &&
+    ws &&
+    ws.readyState < WebSocket.CLOSED
+  ) {
+    return;
+  }
+
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    sendSignal({
+      event: "join",
+      payload: {
+        classroom_id: selection.classroomId,
+        seat_no_text: selection.seatNoText,
+      },
+    });
+    isJoinRequested.value = true;
+    return;
+  }
+
+  pendingJoinSelection = {
+    classroomId: selection.classroomId,
+    seatNoText: selection.seatNoText,
+  };
+  isJoinRequested.value = true;
+  statusText.value = pendingStatus;
+}
+
+function scheduleAutoReconnect(delayMs = STUDENT_AUTO_RECONNECT_DELAY_MS) {
+  if (reconnectTimer !== null) {
+    return;
+  }
+
+  reconnectTimer = window.setTimeout(() => {
+    reconnectTimer = null;
+
+    if (isConnected.value) {
+      return;
+    }
+
+    const selection = getActiveJoinSelection();
+    if (!selection) {
+      return;
+    }
+
+    queueJoinRequest(selection, "連線已中斷，正在重新連線...");
+  }, delayMs);
+}
+
+function restorePersistedJoinState() {
+  const selection = getActiveJoinSelection();
+  if (!selection) {
+    return;
+  }
+
+  statusText.value = "正在恢復登入狀態...";
+  signalError.value = "";
+  queueJoinRequest(selection, "正在恢復登入狀態...");
+}
 
 function disposePeerConnection() {
   if (lessonChannel) {
@@ -149,10 +460,12 @@ function disposePeerConnection() {
 }
 
 function handleLessonTransportInterrupted(message: string) {
-  if (!selfId) {
+  if (!hasJoinedClassroom.value) {
     resetToJoinState(message);
     return;
   }
+
+  persistStudentBoardSnapshot();
 
   isConnected.value = false;
   isJoinRequested.value = false;
@@ -172,6 +485,7 @@ function handleLessonTransportInterrupted(message: string) {
   teacherId = undefined;
   statusText.value = message;
   signalError.value = "";
+  scheduleAutoReconnect();
 }
 
 function setTeacherBroadcastStream(stream: MediaStream | null) {
@@ -356,8 +670,12 @@ function stopFocusStatusDebounceTimer() {
   }
 }
 
+function isBrowserInForeground() {
+  return document.visibilityState === "visible" && document.hasFocus();
+}
+
 function resolveCurrentFocusStatus(): StudentFocusStatus {
-  return document.visibilityState === "visible" ? "focused" : "away";
+  return isBrowserInForeground() ? "focused" : "away";
 }
 
 function sendFocusStatusNow(status: StudentFocusStatus) {
@@ -505,11 +823,15 @@ function onStudentTabChanged(tab: unknown) {
 }
 
 function resetToJoinState(message = "連線已中斷，請重新加入") {
+  stopReconnectTimer();
   isConnected.value = false;
   isJoinRequested.value = false;
   teacherId = undefined;
   selfId = undefined;
   joinedSessionId.value = null;
+  clearJoinedSelection();
+  clearPersistedJoinState();
+  clearPersistedStudentBoardSnapshot();
   activeMode.value = "home";
   activeTab.value = "teacher-board";
   isTeacherBoardViewForced.value = false;
@@ -581,6 +903,7 @@ function ensureSocket() {
   ws = new WebSocket(wsUrl.value);
 
   ws.onopen = () => {
+    stopReconnectTimer();
     statusText.value = "已連上訊號服務";
     signalError.value = "";
     if (pendingJoinSelection) {
@@ -597,12 +920,32 @@ function ensureSocket() {
   };
 
   ws.onclose = () => {
-    resetToJoinState("連線已中斷，請重新加入");
+    ws = null;
+
+    if (!hasJoinedClassroom.value) {
+      resetToJoinState("連線已中斷，請重新加入");
+      return;
+    }
+
+    persistStudentBoardSnapshot();
+
+    isConnected.value = false;
+    isJoinRequested.value = false;
+    disposePeerConnection();
+    teacherId = undefined;
+    statusText.value = "連線已中斷，正在重新連線...";
+    signalError.value = "";
+    scheduleAutoReconnect();
   };
 
   ws.onerror = () => {
     isConnected.value = false;
     signalError.value = "訊號服務連線失敗";
+
+    if (hasJoinedClassroom.value) {
+      persistStudentBoardSnapshot();
+      scheduleAutoReconnect();
+    }
   };
 
   ws.onmessage = async (event) => {
@@ -650,6 +993,15 @@ function ensureSocket() {
       if (message.event === "joined") {
         selfId = message.source;
         joinedSessionId.value = message.source ?? null;
+        if (pendingJoinSelection) {
+          markJoinedSelection(
+            pendingJoinSelection.classroomId,
+            pendingJoinSelection.seatNoText,
+          );
+        }
+        if (joinedClassroomId.value !== null && joinedSeatNoText.value.trim()) {
+          persistJoinState(joinedClassroomId.value, joinedSeatNoText.value);
+        }
         teacherId = message.target;
         statusText.value = "加入成功，建立 WebRTC 連線中...";
         await startOffer();
@@ -1012,6 +1364,34 @@ function handleLessonMessage(raw: string) {
   }
 }
 
+function pushStudentSnapshotToTeacherIfNotEmpty(
+  reason: WhiteboardTeacherStudentSnapshotMessage["reason"] = "resync",
+) {
+  if (!isConnected.value) {
+    return;
+  }
+
+  const hasDrawableStroke = studentSnapshot.value.strokes.some(
+    (stroke) => stroke.points.length > 0,
+  );
+  if (!hasDrawableStroke) {
+    return;
+  }
+
+  const snapshot = cloneWhiteboardSnapshot(studentSnapshot.value);
+  snapshot.backgroundImage = null;
+
+  const message: WhiteboardTeacherStudentSnapshotMessage = {
+    kind: "teacher-student-snapshot",
+    boardTab: "student-board",
+    seq: Math.max(0, studentNextSequence - 1),
+    reason,
+    snapshot,
+  };
+
+  sendLessonMessage(message);
+}
+
 function bindLessonChannel(channel: RTCDataChannel) {
   lessonChannel = channel;
   lessonChannel.bufferedAmountLowThreshold = LESSON_SEND_LOW_WATERMARK_BYTES;
@@ -1021,6 +1401,8 @@ function bindLessonChannel(channel: RTCDataChannel) {
     isJoinRequested.value = false;
     statusText.value = "已連線，請專心學習";
     signalError.value = "";
+    restorePersistedStudentBoardSnapshot();
+    pushStudentSnapshotToTeacherIfNotEmpty("resync");
     drainLessonMessages();
     requestTeacherSnapshot("join-init");
     queueFocusStatus(resolveCurrentFocusStatus(), true);
@@ -1053,15 +1435,37 @@ function handleStudentSyncEvent(payload: WhiteboardIncrementalEventPayload) {
 }
 
 function handleVisibilityChange() {
+  if (joinedClassroomId.value !== null && joinedSeatNoText.value.trim()) {
+    persistJoinState(joinedClassroomId.value, joinedSeatNoText.value);
+    if (document.visibilityState === "hidden") {
+      persistStudentBoardSnapshot();
+    }
+  }
+
   if (isConnected.value) {
     queueFocusStatus(resolveCurrentFocusStatus());
+    return;
+  }
+
+  if (document.visibilityState === "visible" && hasJoinedClassroom.value) {
+    scheduleAutoReconnect(0);
   }
 }
 
+function handleWindowForegroundChange() {
+  if (!isConnected.value) {
+    return;
+  }
+
+  queueFocusStatus(resolveCurrentFocusStatus());
+}
+
 function leaveClassroom() {
+  stopReconnectTimer();
   pendingJoinSelection = null;
   isJoinRequested.value = false;
   signalError.value = "";
+  clearPersistedStudentBoardSnapshot();
   closeSignalSocket();
   resetToJoinState("已離開教室");
 }
@@ -1131,42 +1535,23 @@ function handleJoin(student: ClassroomStudent) {
     return;
   }
 
-  ensureSocket();
-
-  if (
-    isJoinRequested.value &&
-    pendingJoinSelection?.classroomId ===
-      classroomState.value.current_classroom.id &&
-    pendingJoinSelection?.seatNoText === student.seat_no_text &&
-    ws &&
-    ws.readyState < WebSocket.CLOSED
-  ) {
-    return;
-  }
-
-  if (ws && ws.readyState === WebSocket.OPEN) {
-    sendSignal({
-      event: "join",
-      payload: {
-        classroom_id: classroomState.value.current_classroom.id,
-        seat_no_text: student.seat_no_text,
-      },
-    });
-    isJoinRequested.value = true;
-  } else {
-    pendingJoinSelection = {
-      classroomId: classroomState.value.current_classroom.id,
-      seatNoText: student.seat_no_text,
-    };
-    isJoinRequested.value = true;
-    statusText.value = "連線建立中，準備送出加入請求...";
-  }
+  markJoinedSelection(
+    classroomState.value.current_classroom.id,
+    student.seat_no_text,
+  );
+  queueJoinRequest({
+    classroomId: classroomState.value.current_classroom.id,
+    seatNoText: student.seat_no_text,
+  });
 }
 
 onMounted(() => {
   document.addEventListener("visibilitychange", handleVisibilityChange);
+  window.addEventListener("focus", handleWindowForegroundChange);
+  window.addEventListener("blur", handleWindowForegroundChange);
   void refreshClassroomStateFromApi();
   startClassroomPollTimer();
+  restorePersistedJoinState();
 });
 
 watch([teacherBroadcastVideoRef, teacherBroadcastStream], () => {
@@ -1189,7 +1574,10 @@ watch([teacherBroadcastVideoRef, teacherBroadcastStream], () => {
 
 onBeforeUnmount(() => {
   document.removeEventListener("visibilitychange", handleVisibilityChange);
+  window.removeEventListener("focus", handleWindowForegroundChange);
+  window.removeEventListener("blur", handleWindowForegroundChange);
   stopClassroomPollTimer();
+  stopReconnectTimer();
 
   resetLessonSendQueue();
   stopStudentBatchTimer();
