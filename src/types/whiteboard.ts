@@ -18,14 +18,16 @@ export type WhiteboardMode =
   | "contact-book"
   | "whiteboard"
   | "quick-qa"
-  | "teacher-broadcast";
+  | "teacher-broadcast"
+  | "student-points";
 
 export type ActiveModule =
   | "home"
   | "contact_book_management"
   | "whiteboard"
   | "quick_qa"
-  | "teacher_screen_broadcast";
+  | "teacher_screen_broadcast"
+  | "student_points";
 export type WhiteboardBoardTab = "teacher-board" | "student-board";
 export type QuickQaOption = "A" | "B" | "C" | "D";
 

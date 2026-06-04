@@ -61,6 +61,9 @@ const props = defineProps<{
 const { appVersionLabel } = useAppVersion(props.baseUrl);
 
 const students = ref<StudentSession[]>([]);
+const classroomStudents = ref<ClassroomStatePayload["students"]>([]);
+const studentPointsById = reactive(new Map<string, number>());
+const studentGroupById = reactive(new Map<string, number>());
 const currentClassroomName = ref("載入中");
 const currentClassroomId = ref<number | null>(null);
 const wsStatus = ref("尚未連線");
@@ -77,6 +80,17 @@ const studentOpenUrlInput = ref("");
 const studentOpenUrlError = ref("");
 const activeFeature = ref<WhiteboardMode>("home");
 const activeWhiteboardTab = ref<WhiteboardBoardTab>("teacher-board");
+const studentPointsTab = ref<"individual" | "group">("individual");
+const studentGroupCount = ref(3);
+const studentGroupCountCommitted = ref(3);
+const studentPointsResetDialogVisible = ref(false);
+const studentGroupResizeConfirmVisible = ref(false);
+const studentGroupResizePendingCount = ref(0);
+const studentGroupResizePendingTarget = ref<number | null>(null);
+const studentGroupResizePendingPointIds = ref<string[]>([]);
+const studentPointsDraggingId = ref<string | null>(null);
+const studentPointsDragOverGroup = ref<number | null>(null);
+let studentPointsDragPreviewElement: HTMLElement | null = null;
 const forceTeacherBoardView = ref(false);
 const modeVersion = ref(0);
 const tabVersion = ref(0);
@@ -297,6 +311,121 @@ function normalizeStudentFocusUpdatedAt(value: unknown, fallback = 0): number {
   return fallback;
 }
 
+function normalizeStudentPoints(value: unknown, fallback = 0): number {
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return value;
+  }
+
+  return fallback;
+}
+
+function normalizeStudentGroupNo(value: unknown, fallback = 0): number {
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return Math.max(0, Math.floor(value));
+  }
+
+  return fallback;
+}
+
+function toStudentPointsId(studentId: number): string {
+  return `student-${studentId}`;
+}
+
+function syncStudentPointMapsFromClassroom(
+  nextStudents: ClassroomStatePayload["students"],
+) {
+  const activeIds = new Set(
+    nextStudents.map((student) => toStudentPointsId(student.id)),
+  );
+
+  for (const studentId of studentPointsById.keys()) {
+    if (!activeIds.has(studentId)) {
+      studentPointsById.delete(studentId);
+      studentGroupById.delete(studentId);
+    }
+  }
+
+  for (const student of nextStudents) {
+    const pointId = toStudentPointsId(student.id);
+    studentPointsById.set(
+      pointId,
+      normalizeStudentPoints(
+        student.points,
+        studentPointsById.get(pointId) ?? 0,
+      ),
+    );
+    studentGroupById.set(
+      pointId,
+      normalizeStudentGroupNo(
+        student.group_no,
+        studentGroupById.get(pointId) ?? 0,
+      ),
+    );
+  }
+}
+
+function applyClassroomState(state: ClassroomStatePayload) {
+  currentClassroomName.value = state.current_classroom.name;
+  currentClassroomId.value = state.current_classroom.id;
+  classroomStudents.value = state.students;
+  syncStudentPointMapsFromClassroom(state.students);
+}
+
+async function studentPointsApi<TRequest extends Record<string, unknown>>(
+  path: string,
+  body: TRequest | null,
+) {
+  const url = new URL(path, props.baseUrl).toString();
+  const response = await fetch(url, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: body ? JSON.stringify(body) : undefined,
+  });
+
+  if (!response.ok) {
+    const errorPayload = (await response.json().catch(() => null)) as {
+      message?: string;
+    } | null;
+    throw new Error(errorPayload?.message || `請求失敗 (${response.status})`);
+  }
+
+  const payload = (await response.json()) as ClassroomStatePayload;
+  applyClassroomState(payload);
+}
+
+function resolveStudentIdByPointId(pointId: string): number | null {
+  const student = studentPointEntries.value.find(
+    (item) => item.pointId === pointId,
+  );
+  return student?.studentId ?? null;
+}
+
+function syncStudentPointMaps(nextStudents: StudentSession[]) {
+  for (const student of nextStudents) {
+    if (typeof student.student_id !== "number") {
+      continue;
+    }
+
+    const pointId = toStudentPointsId(student.student_id);
+    studentPointsById.set(
+      pointId,
+      normalizeStudentPoints(
+        student.points,
+        studentPointsById.get(pointId) ?? 0,
+      ),
+    );
+    studentGroupById.set(
+      pointId,
+      normalizeStudentGroupNo(
+        student.group_no,
+        studentGroupById.get(pointId) ?? 0,
+      ),
+    );
+  }
+}
+
 function mergeStudentsWithFocus(
   nextStudents: StudentSession[],
 ): StudentSession[] {
@@ -392,7 +521,251 @@ function toActiveModule(mode: WhiteboardMode): ActiveModule {
       return "teacher_screen_broadcast";
     case "contact-book":
       return "contact_book_management";
+    case "student-points":
+      return "student_points";
   }
+}
+
+async function changeStudentPoints(pointId: string, delta: number) {
+  const studentId = resolveStudentIdByPointId(pointId);
+  if (studentId === null) {
+    return;
+  }
+
+  const current = studentPointsById.get(pointId) ?? 0;
+  studentPointsById.set(pointId, current + delta);
+
+  try {
+    await studentPointsApi("/api/student-points/adjust-student", {
+      student_id: studentId,
+      delta,
+    });
+  } catch (error) {
+    studentPointsById.set(pointId, current);
+    showRtcError(`更新學生積分失敗: ${String(error)}`);
+  }
+}
+
+async function changeAllStudentPoints(delta: number) {
+  const snapshot = new Map(studentPointsById);
+  for (const student of studentPointEntries.value) {
+    const current = studentPointsById.get(student.pointId) ?? 0;
+    studentPointsById.set(student.pointId, current + delta);
+  }
+
+  try {
+    await studentPointsApi("/api/student-points/adjust-all", { delta });
+  } catch (error) {
+    studentPointsById.clear();
+    for (const [id, points] of snapshot) {
+      studentPointsById.set(id, points);
+    }
+    showRtcError(`更新全班積分失敗: ${String(error)}`);
+  }
+}
+
+async function resetStudentPoints() {
+  const snapshot = new Map(studentPointsById);
+  for (const student of studentPointEntries.value) {
+    studentPointsById.set(student.pointId, 0);
+  }
+
+  try {
+    await studentPointsApi("/api/student-points/reset-all", null);
+    studentPointsResetDialogVisible.value = false;
+  } catch (error) {
+    studentPointsById.clear();
+    for (const [id, points] of snapshot) {
+      studentPointsById.set(id, points);
+    }
+    showRtcError(`重設積分失敗: ${String(error)}`);
+  }
+}
+
+async function adjustStudentGroupCount(nextCount: number | string) {
+  const previousGroupCount = studentGroupCountCommitted.value;
+  const normalized = Math.max(
+    1,
+    Math.min(10, Math.floor(Number(nextCount) || 1)),
+  );
+
+  const overflowPointIds: string[] = [];
+  for (const student of studentPointEntries.value) {
+    const groupNo = studentGroupById.get(student.pointId) ?? 0;
+    if (groupNo > normalized) {
+      overflowPointIds.push(student.pointId);
+    }
+  }
+
+  if (normalized < previousGroupCount && overflowPointIds.length > 0) {
+    studentGroupResizePendingTarget.value = normalized;
+    studentGroupResizePendingPointIds.value = overflowPointIds;
+    studentGroupResizePendingCount.value = overflowPointIds.length;
+    studentGroupResizeConfirmVisible.value = true;
+    studentGroupCount.value = previousGroupCount;
+    return;
+  }
+
+  studentGroupCount.value = normalized;
+  studentGroupCountCommitted.value = normalized;
+
+  await Promise.all(
+    overflowPointIds.map((pointId) => updateStudentGroupNo(pointId, 0)),
+  );
+}
+
+function cancelStudentGroupResize() {
+  studentGroupCount.value = studentGroupCountCommitted.value;
+  studentGroupResizeConfirmVisible.value = false;
+  studentGroupResizePendingTarget.value = null;
+  studentGroupResizePendingPointIds.value = [];
+  studentGroupResizePendingCount.value = 0;
+}
+
+async function confirmStudentGroupResize() {
+  const nextGroupCount = studentGroupResizePendingTarget.value;
+  if (nextGroupCount === null) {
+    cancelStudentGroupResize();
+    return;
+  }
+
+  const overflowPointIds = [...studentGroupResizePendingPointIds.value];
+  cancelStudentGroupResize();
+  studentGroupCount.value = nextGroupCount;
+  studentGroupCountCommitted.value = nextGroupCount;
+
+  await Promise.all(
+    overflowPointIds.map((pointId) => updateStudentGroupNo(pointId, 0)),
+  );
+}
+
+async function updateStudentGroupNo(pointId: string, groupNo: number) {
+  const studentId = resolveStudentIdByPointId(pointId);
+  if (studentId === null) {
+    return;
+  }
+
+  const normalized = Math.max(0, Math.floor(groupNo));
+  const previous = studentGroupById.get(pointId) ?? 0;
+  studentGroupById.set(pointId, normalized);
+
+  try {
+    await studentPointsApi("/api/student-points/assign-group", {
+      student_id: studentId,
+      group_no: normalized,
+    });
+  } catch (error) {
+    studentGroupById.set(pointId, previous);
+    showRtcError(`更新分組失敗: ${String(error)}`);
+  }
+}
+
+async function changeGroupStudentPoints(groupNo: number, delta: number) {
+  const affectedStudents = studentGroupBuckets.value.buckets.get(groupNo) ?? [];
+  const snapshot = new Map(studentPointsById);
+  for (const student of affectedStudents) {
+    const current = studentPointsById.get(student.pointId) ?? 0;
+    studentPointsById.set(student.pointId, current + delta);
+  }
+
+  try {
+    await studentPointsApi("/api/student-points/adjust-group", {
+      group_no: groupNo,
+      delta,
+    });
+  } catch (error) {
+    studentPointsById.clear();
+    for (const [id, points] of snapshot) {
+      studentPointsById.set(id, points);
+    }
+    showRtcError(`更新群組積分失敗: ${String(error)}`);
+  }
+}
+
+function clearStudentPointsDragPreviewElement() {
+  if (!studentPointsDragPreviewElement) {
+    return;
+  }
+
+  studentPointsDragPreviewElement.remove();
+  studentPointsDragPreviewElement = null;
+}
+
+function createStudentPointsDragPreviewElement(source: HTMLElement) {
+  clearStudentPointsDragPreviewElement();
+
+  const preview = source.cloneNode(true);
+  if (!(preview instanceof HTMLElement)) {
+    return null;
+  }
+
+  preview.style.position = "fixed";
+  preview.style.top = "-1000px";
+  preview.style.left = "-1000px";
+  preview.style.pointerEvents = "none";
+  preview.style.zIndex = "-1";
+  preview.style.opacity = "1";
+  document.body.appendChild(preview);
+  studentPointsDragPreviewElement = preview;
+  return preview;
+}
+
+function onStudentPointDragStart(pointId: string, event: DragEvent) {
+  studentPointsDraggingId.value = pointId;
+  event.dataTransfer?.setData("text/plain", pointId);
+  const currentTarget =
+    event.currentTarget instanceof HTMLElement ? event.currentTarget : null;
+  if (currentTarget) {
+    currentTarget.classList.add("is-dragging-token");
+  }
+
+  if (event.dataTransfer) {
+    event.dataTransfer.effectAllowed = "move";
+    if (currentTarget) {
+      const preview = createStudentPointsDragPreviewElement(currentTarget);
+      if (preview) {
+        event.dataTransfer.setDragImage(preview, 16, 16);
+      }
+    }
+  }
+}
+
+function onStudentPointDragOver(groupNo: number, event: DragEvent) {
+  event.preventDefault();
+  studentPointsDragOverGroup.value = groupNo;
+  if (event.dataTransfer) {
+    event.dataTransfer.dropEffect = "move";
+  }
+}
+
+async function onStudentPointDrop(groupNo: number, event: DragEvent) {
+  event.preventDefault();
+  const draggedId =
+    event.dataTransfer?.getData("text/plain") || studentPointsDraggingId.value;
+  if (!draggedId) {
+    return;
+  }
+
+  await updateStudentGroupNo(draggedId, groupNo);
+  studentPointsDragOverGroup.value = null;
+  studentPointsDraggingId.value = null;
+}
+
+function onStudentPointDragEnd(event?: DragEvent) {
+  if (event?.currentTarget instanceof HTMLElement) {
+    event.currentTarget.classList.remove("is-dragging-token");
+  }
+
+  const draggingElements = document.querySelectorAll(
+    ".student-points-draggable.is-dragging-token",
+  );
+  for (const element of draggingElements) {
+    element.classList.remove("is-dragging-token");
+  }
+  clearStudentPointsDragPreviewElement();
+
+  studentPointsDragOverGroup.value = null;
+  studentPointsDraggingId.value = null;
 }
 
 function toBroadcastCaptureConstraints() {
@@ -522,6 +895,65 @@ const quickQaLeaderboardTop10 = computed(() => {
       return left.nickname.localeCompare(right.nickname, "zh-Hant");
     })
     .slice(0, 10);
+});
+
+type StudentPointEntry = {
+  pointId: string;
+  studentId: number;
+  seat_no_text: string;
+  nickname: string;
+  points: number;
+  groupNo: number;
+};
+
+const studentPointEntries = computed<StudentPointEntry[]>(() =>
+  [...classroomStudents.value]
+    .sort((left, right) => {
+      const seatCompare = studentNameCollator.compare(
+        left.seat_no_text,
+        right.seat_no_text,
+      );
+      if (seatCompare !== 0) {
+        return seatCompare;
+      }
+      return studentNameCollator.compare(left.nickname, right.nickname);
+    })
+    .map((student) => {
+      const pointId = toStudentPointsId(student.id);
+      return {
+        pointId,
+        studentId: student.id,
+        seat_no_text: student.seat_no_text,
+        nickname: student.display_name,
+        points: studentPointsById.get(pointId) ?? 0,
+        groupNo: studentGroupById.get(pointId) ?? 0,
+      };
+    }),
+);
+
+const studentGroupNumbers = computed(() =>
+  Array.from({ length: studentGroupCount.value }, (_, index) => index + 1),
+);
+
+const studentGroupBuckets = computed(() => {
+  const buckets = new Map<number, StudentPointEntry[]>();
+  for (let groupNo = 1; groupNo <= studentGroupCount.value; groupNo += 1) {
+    buckets.set(groupNo, []);
+  }
+
+  const ungrouped: StudentPointEntry[] = [];
+  for (const student of studentPointEntries.value) {
+    const groupNo = studentGroupById.get(student.pointId) ?? 0;
+    if (groupNo > 0 && groupNo <= studentGroupCount.value) {
+      const bucket = buckets.get(groupNo) ?? [];
+      bucket.push(student);
+      buckets.set(groupNo, bucket);
+    } else {
+      ungrouped.push(student);
+    }
+  }
+
+  return { buckets, ungrouped };
 });
 
 const teacherBackgroundImage = computed(() => teacherBackground.value);
@@ -1654,6 +2086,10 @@ function activateContactBook() {
   applyFeatureMode("contact-book");
 }
 
+function activateStudentPoints() {
+  applyFeatureMode("student-points");
+}
+
 function activateTeacherBoardTab() {
   applyWhiteboardTab("teacher-board");
 }
@@ -2144,8 +2580,7 @@ async function handleSignal(message: SignalEnvelope) {
   if (message.event === "classroom-state") {
     const payload = message.payload as { state?: ClassroomStatePayload };
     if (payload?.state) {
-      currentClassroomName.value = payload.state.current_classroom.name;
-      currentClassroomId.value = payload.state.current_classroom.id;
+      applyClassroomState(payload.state);
     }
     return;
   }
@@ -2156,6 +2591,7 @@ async function handleSignal(message: SignalEnvelope) {
       | undefined;
     const nextStudents = payload?.students ?? [];
     const mergedStudents = mergeStudentsWithFocus(nextStudents);
+    syncStudentPointMaps(mergedStudents);
     students.value = mergedStudents;
     reconcileStudentConnections(mergedStudents);
     return;
@@ -2401,6 +2837,13 @@ onBeforeUnmount(() => {
           @click="toggleTeacherBroadcast"
         >
           {{ teacherBroadcastActive ? "停止廣播" : "廣播教師畫面" }}
+        </v-btn>
+        <v-btn
+          color="teal"
+          :variant="activeFeature === 'student-points' ? 'flat' : 'outlined'"
+          @click="activateStudentPoints"
+        >
+          學生積點
         </v-btn>
         <v-btn color="info" variant="tonal" @click="openStudentUrlDialog">
           學生開啟網頁
@@ -2743,6 +3186,247 @@ onBeforeUnmount(() => {
               </v-card>
             </v-card-text>
           </v-card>
+        </div>
+
+        <div
+          v-else-if="activeFeature === 'student-points'"
+          class="student-points-layout"
+        >
+          <v-card rounded="lg" variant="outlined" class="student-points-card">
+            <v-card-title class="d-flex align-center justify-space-between">
+              <span>學生積點</span>
+              <v-chip color="teal" variant="flat" size="small">
+                即時更新
+              </v-chip>
+            </v-card-title>
+            <v-card-text class="d-flex flex-column ga-4">
+              <v-tabs v-model="studentPointsTab" color="teal" density="compact">
+                <v-tab value="individual">個別加分</v-tab>
+                <v-tab value="group">分組模式</v-tab>
+              </v-tabs>
+
+              <div
+                v-if="studentPointsTab === 'individual'"
+                class="student-points-individual-grid"
+              >
+                <div class="student-points-individual-actions">
+                  <v-btn
+                    color="success"
+                    variant="tonal"
+                    @click="changeAllStudentPoints(1)"
+                    >全班 +1</v-btn
+                  >
+                  <v-btn
+                    color="warning"
+                    variant="tonal"
+                    @click="changeAllStudentPoints(-1)"
+                    >全班 -1</v-btn
+                  >
+                  <v-btn
+                    color="error"
+                    variant="tonal"
+                    @click="studentPointsResetDialogVisible = true"
+                    >重設積分</v-btn
+                  >
+                </div>
+                <v-card
+                  v-for="student in studentPointEntries"
+                  :key="student.pointId"
+                  rounded="lg"
+                  variant="outlined"
+                  class="student-points-student-card"
+                >
+                  <v-card-text class="d-flex flex-column ga-3">
+                    <div class="text-subtitle-2 font-weight-bold">
+                      {{ student.nickname }}
+                    </div>
+                    <div class="d-flex align-center justify-space-between ga-2">
+                      <v-btn
+                        icon="mdi-minus"
+                        size="small"
+                        color="warning"
+                        variant="tonal"
+                        @click="changeStudentPoints(student.pointId, -1)"
+                      />
+                      <div class="text-h5 font-weight-bold">
+                        {{ student.points }}
+                      </div>
+                      <v-btn
+                        icon="mdi-plus"
+                        size="small"
+                        color="success"
+                        variant="tonal"
+                        @click="changeStudentPoints(student.pointId, 1)"
+                      />
+                    </div>
+                  </v-card-text>
+                </v-card>
+              </div>
+
+              <div v-else class="d-flex flex-column ga-3">
+                <div class="student-points-group-count-wrap">
+                  <v-text-field
+                    v-model.number="studentGroupCount"
+                    label="分幾組"
+                    type="number"
+                    min="1"
+                    max="10"
+                    variant="outlined"
+                    density="compact"
+                    hide-details
+                    class="student-points-group-count-input"
+                    prepend-inner-icon="mdi-account-group"
+                    @update:model-value="adjustStudentGroupCount"
+                  />
+                  <v-chip size="small" color="teal" variant="tonal">
+                    1 - 10 組
+                  </v-chip>
+                </div>
+
+                <div class="student-points-group-layout">
+                  <div
+                    class="student-points-drop-zone student-points-ungrouped-zone"
+                    :class="{
+                      'is-drag-over': studentPointsDragOverGroup === 0,
+                    }"
+                    @dragover="onStudentPointDragOver(0, $event)"
+                    @drop="onStudentPointDrop(0, $event)"
+                  >
+                    <div class="text-subtitle-2 mb-2">未分組</div>
+                    <div class="student-points-drop-zone-list">
+                      <v-btn
+                        v-for="student in studentGroupBuckets.ungrouped"
+                        :key="student.pointId"
+                        rounded="pill"
+                        variant="tonal"
+                        color="deep-orange"
+                        class="student-points-draggable student-points-token-btn"
+                        draggable="true"
+                        @dragstart="
+                          onStudentPointDragStart(student.pointId, $event)
+                        "
+                        @dragend="onStudentPointDragEnd($event)"
+                      >
+                        {{ student.nickname }}
+                        <v-chip
+                          size="x-small"
+                          color="amber-darken-2"
+                          variant="flat"
+                          class="ml-1"
+                        >
+                          {{ student.points }}
+                        </v-chip>
+                      </v-btn>
+                    </div>
+                  </div>
+
+                  <div
+                    class="student-points-groups-zone d-flex flex-column ga-3"
+                  >
+                    <div
+                      v-for="groupNo in studentGroupNumbers"
+                      :key="groupNo"
+                      class="student-points-drop-zone student-points-group-zone"
+                      :class="{
+                        'is-drag-over': studentPointsDragOverGroup === groupNo,
+                      }"
+                      @dragover="onStudentPointDragOver(groupNo, $event)"
+                      @drop="onStudentPointDrop(groupNo, $event)"
+                    >
+                      <div
+                        class="d-flex align-center justify-space-between mb-2 ga-2"
+                      >
+                        <div class="text-subtitle-2">第 {{ groupNo }} 組</div>
+                        <div class="d-flex ga-1">
+                          <v-btn
+                            icon="mdi-plus"
+                            size="x-small"
+                            color="success"
+                            variant="tonal"
+                            class="student-points-group-action-btn"
+                            @click="changeGroupStudentPoints(groupNo, 1)"
+                          />
+                          <v-btn
+                            icon="mdi-minus"
+                            size="x-small"
+                            color="warning"
+                            variant="tonal"
+                            class="student-points-group-action-btn"
+                            @click="changeGroupStudentPoints(groupNo, -1)"
+                          />
+                        </div>
+                      </div>
+                      <div class="student-points-drop-zone-list">
+                        <v-btn
+                          v-for="student in studentGroupBuckets.buckets.get(
+                            groupNo,
+                          ) ?? []"
+                          :key="student.pointId"
+                          rounded="pill"
+                          variant="tonal"
+                          color="indigo"
+                          class="student-points-draggable student-points-token-btn"
+                          draggable="true"
+                          @dragstart="
+                            onStudentPointDragStart(student.pointId, $event)
+                          "
+                          @dragend="onStudentPointDragEnd($event)"
+                        >
+                          {{ student.nickname }}
+                          <v-chip
+                            size="x-small"
+                            color="cyan-darken-2"
+                            variant="flat"
+                            class="ml-1"
+                          >
+                            {{ student.points }}
+                          </v-chip>
+                        </v-btn>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </v-card-text>
+          </v-card>
+
+          <v-dialog v-model="studentPointsResetDialogVisible" max-width="420">
+            <v-card>
+              <v-card-title>重設積分</v-card-title>
+              <v-card-text>確定要把全班積分全部歸零嗎？</v-card-text>
+              <v-card-actions>
+                <v-spacer />
+                <v-btn
+                  variant="text"
+                  @click="studentPointsResetDialogVisible = false"
+                  >取消</v-btn
+                >
+                <v-btn color="error" @click="resetStudentPoints">確認</v-btn>
+              </v-card-actions>
+            </v-card>
+          </v-dialog>
+
+          <v-dialog v-model="studentGroupResizeConfirmVisible" max-width="460">
+            <v-card>
+              <v-card-title>確認縮減分組</v-card-title>
+              <v-card-text>
+                將縮減為
+                {{ studentGroupResizePendingTarget ?? studentGroupCount }} 組，
+                有
+                {{ studentGroupResizePendingCount }}
+                位學生將移到未分組，是否繼續？
+              </v-card-text>
+              <v-card-actions>
+                <v-spacer />
+                <v-btn variant="text" @click="cancelStudentGroupResize"
+                  >取消</v-btn
+                >
+                <v-btn color="warning" @click="confirmStudentGroupResize"
+                  >確認縮組</v-btn
+                >
+              </v-card-actions>
+            </v-card>
+          </v-dialog>
         </div>
 
         <div v-else-if="activeFeature === 'quick-qa'" class="quick-qa-layout">
@@ -3300,6 +3984,136 @@ onBeforeUnmount(() => {
   gap: 12px;
 }
 
+.student-points-layout {
+  height: 100%;
+  min-height: 0;
+}
+
+.student-points-card {
+  height: 100%;
+  overflow: auto;
+}
+
+.student-points-individual-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+  gap: 12px;
+}
+
+.student-points-individual-actions {
+  grid-column: 1 / -1;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  align-items: center;
+}
+
+.student-points-student-card {
+  min-height: 120px;
+}
+
+.student-points-group-layout {
+  display: grid;
+  grid-template-columns: minmax(220px, 320px) minmax(0, 1fr);
+  gap: 12px;
+  min-height: 420px;
+}
+
+.student-points-group-count-wrap {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  width: fit-content;
+  padding: 8px 10px;
+  border: 1px solid rgba(var(--v-theme-outline), 0.35);
+  border-radius: 12px;
+  background: rgba(var(--v-theme-surface-variant), 0.24);
+}
+
+.student-points-group-count-input {
+  width: 170px;
+}
+
+.student-points-drop-zone {
+  border: 1px solid rgba(var(--v-theme-outline), 0.4);
+  border-radius: 12px;
+  padding: 12px;
+  background: linear-gradient(
+    160deg,
+    rgba(var(--v-theme-surface), 0.98),
+    rgba(var(--v-theme-surface-variant), 0.62)
+  );
+  box-shadow: inset 0 0 0 1px rgba(var(--v-theme-on-surface), 0.04);
+  transition:
+    border-color 0.16s ease,
+    background-color 0.16s ease,
+    box-shadow 0.16s ease;
+}
+
+.student-points-ungrouped-zone {
+  border-color: rgba(255, 167, 38, 0.72);
+  background: linear-gradient(
+    145deg,
+    rgba(255, 236, 179, 0.9),
+    rgba(255, 213, 79, 0.35)
+  );
+}
+
+.student-points-group-zone {
+  border-color: rgba(0, 188, 212, 0.62);
+  background: linear-gradient(
+    145deg,
+    rgba(178, 235, 242, 0.72),
+    rgba(38, 198, 218, 0.22)
+  );
+}
+
+.student-points-drop-zone.is-drag-over {
+  border-color: rgb(var(--v-theme-primary));
+  box-shadow:
+    0 0 0 2px rgba(var(--v-theme-primary), 0.3),
+    0 10px 24px rgba(var(--v-theme-primary), 0.18);
+}
+
+.student-points-drop-zone-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  min-height: 80px;
+  align-content: flex-start;
+}
+
+.student-points-draggable {
+  cursor: grab;
+  min-width: 0;
+  max-width: 220px;
+  text-transform: none;
+  font-weight: 700;
+  letter-spacing: 0;
+  justify-content: flex-start;
+}
+
+.student-points-draggable.is-dragging-token {
+  opacity: 0.62;
+}
+
+.student-points-token-btn {
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.18);
+  border: 1px solid rgba(255, 255, 255, 0.45);
+}
+
+.student-points-group-action-btn {
+  min-width: 44px !important;
+  width: 44px !important;
+  height: 44px !important;
+  border-radius: 50%;
+  padding: 0 !important;
+}
+
+.student-points-draggable:active {
+  cursor: grabbing;
+}
+
 .teacher-broadcast-card {
   height: 100%;
 }
@@ -3452,6 +4266,10 @@ onBeforeUnmount(() => {
   .quick-qa-layout {
     grid-template-columns: 1fr;
     grid-template-rows: auto minmax(0, 1fr);
+  }
+
+  .student-points-group-layout {
+    grid-template-columns: 1fr;
   }
 
   .image-tools-panel {

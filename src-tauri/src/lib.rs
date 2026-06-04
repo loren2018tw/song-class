@@ -141,6 +141,8 @@ struct ClassroomStudent {
     nickname: String,
     display_name: String,
     occupied: bool,
+    points: i64,
+    group_no: i64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -248,6 +250,29 @@ struct UpdateClassroomRequest {
 struct UpdateStudentRequest {
     seat_no_text: String,
     nickname: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct UpdateStudentPointsRequest {
+    student_id: i64,
+    delta: i64,
+}
+
+#[derive(Debug, Deserialize)]
+struct UpdateAllStudentPointsRequest {
+    delta: i64,
+}
+
+#[derive(Debug, Deserialize)]
+struct UpdateStudentGroupRequest {
+    student_id: i64,
+    group_no: i64,
+}
+
+#[derive(Debug, Deserialize)]
+struct UpdateGroupPointsRequest {
+    group_no: i64,
+    delta: i64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -609,7 +634,12 @@ fn load_students_by_classroom(
 ) -> Result<Vec<ClassroomStudent>, String> {
     let mut statement = conn
         .prepare(
-            "SELECT id, classroom_id, seat_no_text, nickname
+            "SELECT id,
+                    classroom_id,
+                    seat_no_text,
+                    nickname,
+                    COALESCE(points, 0),
+                    COALESCE(group_no, 0)
              FROM students
              WHERE classroom_id = ?1
              ORDER BY seat_no_text ASC",
@@ -627,6 +657,8 @@ fn load_students_by_classroom(
                 occupied: occupied_seats.contains(&seat_no_text),
                 seat_no_text,
                 nickname,
+                points: row.get(4)?,
+                group_no: row.get(5)?,
             })
         })
         .map_err(|error| format!("查詢學生清單失敗: {error}"))?;
@@ -1976,6 +2008,211 @@ async fn update_student_handler(
     Ok(Json(payload))
 }
 
+fn validate_group_no(group_no: i64) -> Result<i64, String> {
+    if group_no < 0 {
+        return Err("組別不可小於 0".to_string());
+    }
+    Ok(group_no)
+}
+
+async fn adjust_student_points_handler(
+    State(state): State<HttpState>,
+    Json(body): Json<UpdateStudentPointsRequest>,
+) -> Result<Json<ClassroomStatePayload>, (StatusCode, Json<Value>)> {
+    let runtime = state.runtime.clone();
+    let (db_path, classroom_id) = {
+        let guard = runtime.lock().await;
+        (guard.db_path.clone(), guard.current_classroom_id)
+    };
+
+    let conn = Connection::open(db_path).map_err(|error| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("開啟資料庫失敗: {error}"),
+        )
+    })?;
+
+    let updated = conn
+        .execute(
+            "UPDATE students
+             SET points = COALESCE(points, 0) + ?1
+             WHERE id = ?2 AND classroom_id = ?3",
+            params![body.delta, body.student_id, classroom_id],
+        )
+        .map_err(|error| {
+            api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("更新學生積分失敗: {error}"),
+            )
+        })?;
+
+    if updated == 0 {
+        return Err(api_error(StatusCode::NOT_FOUND, "指定學生不存在"));
+    }
+
+    broadcast_classroom_state(&runtime).await;
+    let payload = build_classroom_state(&runtime)
+        .await
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error))?;
+    Ok(Json(payload))
+}
+
+async fn adjust_all_student_points_handler(
+    State(state): State<HttpState>,
+    Json(body): Json<UpdateAllStudentPointsRequest>,
+) -> Result<Json<ClassroomStatePayload>, (StatusCode, Json<Value>)> {
+    let runtime = state.runtime.clone();
+    let (db_path, classroom_id) = {
+        let guard = runtime.lock().await;
+        (guard.db_path.clone(), guard.current_classroom_id)
+    };
+
+    let conn = Connection::open(db_path).map_err(|error| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("開啟資料庫失敗: {error}"),
+        )
+    })?;
+
+    conn.execute(
+        "UPDATE students
+         SET points = COALESCE(points, 0) + ?1
+         WHERE classroom_id = ?2",
+        params![body.delta, classroom_id],
+    )
+    .map_err(|error| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("更新全班積分失敗: {error}"),
+        )
+    })?;
+
+    broadcast_classroom_state(&runtime).await;
+    let payload = build_classroom_state(&runtime)
+        .await
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error))?;
+    Ok(Json(payload))
+}
+
+async fn reset_all_student_points_handler(
+    State(state): State<HttpState>,
+) -> Result<Json<ClassroomStatePayload>, (StatusCode, Json<Value>)> {
+    let runtime = state.runtime.clone();
+    let (db_path, classroom_id) = {
+        let guard = runtime.lock().await;
+        (guard.db_path.clone(), guard.current_classroom_id)
+    };
+
+    let conn = Connection::open(db_path).map_err(|error| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("開啟資料庫失敗: {error}"),
+        )
+    })?;
+
+    conn.execute(
+        "UPDATE students
+         SET points = 0
+         WHERE classroom_id = ?1",
+        params![classroom_id],
+    )
+    .map_err(|error| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("重設全班積分失敗: {error}"),
+        )
+    })?;
+
+    broadcast_classroom_state(&runtime).await;
+    let payload = build_classroom_state(&runtime)
+        .await
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error))?;
+    Ok(Json(payload))
+}
+
+async fn assign_student_group_handler(
+    State(state): State<HttpState>,
+    Json(body): Json<UpdateStudentGroupRequest>,
+) -> Result<Json<ClassroomStatePayload>, (StatusCode, Json<Value>)> {
+    let group_no = validate_group_no(body.group_no)
+        .map_err(|error| api_error(StatusCode::BAD_REQUEST, error))?;
+    let runtime = state.runtime.clone();
+    let (db_path, classroom_id) = {
+        let guard = runtime.lock().await;
+        (guard.db_path.clone(), guard.current_classroom_id)
+    };
+
+    let conn = Connection::open(db_path).map_err(|error| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("開啟資料庫失敗: {error}"),
+        )
+    })?;
+
+    let updated = conn
+        .execute(
+            "UPDATE students
+             SET group_no = ?1
+             WHERE id = ?2 AND classroom_id = ?3",
+            params![group_no, body.student_id, classroom_id],
+        )
+        .map_err(|error| {
+            api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("更新分組失敗: {error}"),
+            )
+        })?;
+
+    if updated == 0 {
+        return Err(api_error(StatusCode::NOT_FOUND, "指定學生不存在"));
+    }
+
+    broadcast_classroom_state(&runtime).await;
+    let payload = build_classroom_state(&runtime)
+        .await
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error))?;
+    Ok(Json(payload))
+}
+
+async fn adjust_group_student_points_handler(
+    State(state): State<HttpState>,
+    Json(body): Json<UpdateGroupPointsRequest>,
+) -> Result<Json<ClassroomStatePayload>, (StatusCode, Json<Value>)> {
+    let group_no = validate_group_no(body.group_no)
+        .map_err(|error| api_error(StatusCode::BAD_REQUEST, error))?;
+    let runtime = state.runtime.clone();
+    let (db_path, classroom_id) = {
+        let guard = runtime.lock().await;
+        (guard.db_path.clone(), guard.current_classroom_id)
+    };
+
+    let conn = Connection::open(db_path).map_err(|error| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("開啟資料庫失敗: {error}"),
+        )
+    })?;
+
+    conn.execute(
+        "UPDATE students
+         SET points = COALESCE(points, 0) + ?1
+         WHERE classroom_id = ?2 AND COALESCE(group_no, 0) = ?3",
+        params![body.delta, classroom_id, group_no],
+    )
+    .map_err(|error| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("更新群組積分失敗: {error}"),
+        )
+    })?;
+
+    broadcast_classroom_state(&runtime).await;
+    let payload = build_classroom_state(&runtime)
+        .await
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error))?;
+    Ok(Json(payload))
+}
+
 fn find_roster_student_for_join(
     db_path: &PathBuf,
     classroom_id: i64,
@@ -2478,6 +2715,26 @@ async fn start_server_impl(
             post(save_class_members_handler),
         )
         .route(
+            "/api/student-points/adjust-student",
+            post(adjust_student_points_handler),
+        )
+        .route(
+            "/api/student-points/adjust-all",
+            post(adjust_all_student_points_handler),
+        )
+        .route(
+            "/api/student-points/reset-all",
+            post(reset_all_student_points_handler),
+        )
+        .route(
+            "/api/student-points/assign-group",
+            post(assign_student_group_handler),
+        )
+        .route(
+            "/api/student-points/adjust-group",
+            post(adjust_group_student_points_handler),
+        )
+        .route(
             "/api/contact-book/tasks",
             get(list_contact_book_tasks_handler).post(create_contact_book_task_handler),
         )
@@ -2897,6 +3154,127 @@ mod tests {
             .query_row("SELECT COUNT(1) FROM classrooms", [], |row| row.get(0))
             .expect("query classroom count");
         assert_eq!(class_count, 1, "should not reseed existing classrooms");
+
+        let _ = fs::remove_file(db_path);
+    }
+
+    #[test]
+    fn student_points_sql_updates_support_single_all_reset_and_group_ops() {
+        let db_path = make_temp_db_path();
+        init_database(&db_path).expect("init should succeed");
+
+        let conn = Connection::open(&db_path).expect("open sqlite database");
+        let class_id: i64 = conn
+            .query_row("SELECT id FROM classrooms LIMIT 1", [], |row| row.get(0))
+            .expect("query classroom id");
+
+        conn.execute_batch(include_str!("../sql/migrations/next_release.sql"))
+            .expect("apply student-points migration draft");
+
+        let first_student_id: i64 = conn
+            .query_row(
+                "SELECT id FROM students WHERE classroom_id = ?1 ORDER BY seat_no_text ASC LIMIT 1",
+                params![class_id],
+                |row| row.get(0),
+            )
+            .expect("query first student id");
+
+        conn.execute(
+            "UPDATE students
+             SET points = COALESCE(points, 0) + ?1
+             WHERE id = ?2 AND classroom_id = ?3",
+            params![1_i64, first_student_id, class_id],
+        )
+        .expect("apply single student +1");
+
+        conn.execute(
+            "UPDATE students
+             SET points = COALESCE(points, 0) + ?1
+             WHERE classroom_id = ?2",
+            params![-1_i64, class_id],
+        )
+        .expect("apply classroom -1");
+
+        conn.execute(
+            "UPDATE students
+             SET group_no = ?1
+             WHERE classroom_id = ?2 AND seat_no_text IN ('01', '02')",
+            params![1_i64, class_id],
+        )
+        .expect("assign group 1");
+
+        conn.execute(
+            "UPDATE students
+             SET points = COALESCE(points, 0) + ?1
+             WHERE classroom_id = ?2 AND COALESCE(group_no, 0) = ?3",
+            params![2_i64, class_id, 1_i64],
+        )
+        .expect("apply group +2");
+
+        let grouped_student_points: i64 = conn
+            .query_row(
+                "SELECT points FROM students WHERE classroom_id = ?1 AND seat_no_text = '02'",
+                params![class_id],
+                |row| row.get(0),
+            )
+            .expect("query grouped student points");
+        assert_eq!(
+            grouped_student_points, 1,
+            "group operation should apply cumulative score changes",
+        );
+
+        conn.execute(
+            "UPDATE students
+             SET points = 0
+             WHERE classroom_id = ?1",
+            params![class_id],
+        )
+        .expect("reset classroom points");
+
+        let max_abs_points: i64 = conn
+            .query_row(
+                "SELECT COALESCE(MAX(ABS(points)), 0) FROM students WHERE classroom_id = ?1",
+                params![class_id],
+                |row| row.get(0),
+            )
+            .expect("verify reset points");
+        assert_eq!(max_abs_points, 0, "reset should zero all points");
+
+        let _ = fs::remove_file(db_path);
+    }
+
+    #[test]
+    fn baseline_can_upgrade_with_next_release_student_points_migration() {
+        let db_path = make_temp_db_path();
+        let conn = Connection::open(&db_path).expect("open sqlite database");
+        let (_, baseline_sql) = baseline_migration().expect("read baseline migration");
+        conn.execute_batch(baseline_sql)
+            .expect("apply baseline schema");
+
+        conn.execute_batch(include_str!("../sql/migrations/next_release.sql"))
+            .expect("apply next_release draft migration");
+
+        let has_group_no: i64 = conn
+            .query_row(
+                "SELECT COUNT(1)
+                 FROM pragma_table_info('students')
+                 WHERE name = 'group_no'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("check group_no column");
+        let has_points: i64 = conn
+            .query_row(
+                "SELECT COUNT(1)
+                 FROM pragma_table_info('students')
+                 WHERE name = 'points'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("check points column");
+
+        assert_eq!(has_group_no, 1, "students should have group_no column");
+        assert_eq!(has_points, 1, "students should have points column");
 
         let _ = fs::remove_file(db_path);
     }

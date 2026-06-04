@@ -16,6 +16,8 @@ export interface StudentSession {
   connected: boolean;
   focus_status?: StudentFocusStatus;
   focus_updated_at?: number;
+  points?: number;
+  group_no?: number;
 }
 
 export interface ClassroomSummary {
@@ -30,6 +32,8 @@ export interface ClassroomStudent {
   nickname: string;
   display_name: string;
   occupied: boolean;
+  points: number;
+  group_no: number;
 }
 
 export interface ClassroomStatePayload {
@@ -54,7 +58,8 @@ export type ActiveModule =
   | "contact_book_management"
   | "whiteboard"
   | "quick_qa"
-  | "teacher_screen_broadcast";
+  | "teacher_screen_broadcast"
+  | "student_points";
 
 export interface LessonModuleState {
   activeModule: ActiveModule;
