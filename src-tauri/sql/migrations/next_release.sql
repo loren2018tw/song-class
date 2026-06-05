@@ -3,13 +3,3 @@
 -- Example:
 -- ALTER TABLE students ADD COLUMN avatar_url TEXT NOT NULL DEFAULT '';
 
-ALTER TABLE students ADD COLUMN group_no INTEGER NOT NULL DEFAULT 0;
-ALTER TABLE students ADD COLUMN points INTEGER NOT NULL DEFAULT 0;
-
-CREATE TABLE IF NOT EXISTS reminder_boards (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    category TEXT NOT NULL,
-    title TEXT NOT NULL,
-    subtitle TEXT NOT NULL,
-    icon TEXT NOT NULL
-);
