@@ -12,6 +12,9 @@ import QrcodeVue from "qrcode.vue";
 import WhiteboardCanvas from "../components/WhiteboardCanvas.vue";
 import ContactBookManager from "../components/ContactBookManager.vue";
 import StudentListCard from "../components/StudentListCard.vue";
+import ReminderBoardView from "./ReminderBoardView.vue";
+import ReminderBoardSettingsView from "./ReminderBoardSettingsView.vue";
+import type { ReminderBoard } from "../types/reminderBoard";
 import { useAppVersion } from "../composables/useAppVersion";
 import { createPeerConnection } from "../composables/usePeerConnection";
 import type {
@@ -52,6 +55,7 @@ import {
   type WhiteboardStudentViewControlMessage,
   type WhiteboardSyncMessage,
   type StudentFocusStatusMessage,
+  type ReminderBoardStateMessage,
 } from "../types/whiteboard";
 
 const props = defineProps<{
@@ -83,6 +87,7 @@ const activeWhiteboardTab = ref<WhiteboardBoardTab>("teacher-board");
 const studentPointsTab = ref<"individual" | "group">("individual");
 const studentGroupCount = ref(3);
 const studentGroupCountCommitted = ref(3);
+const studentGroupCountInitialized = ref(false);
 const studentPointsResetDialogVisible = ref(false);
 const studentGroupResizeConfirmVisible = ref(false);
 const studentGroupResizePendingCount = ref(0);
@@ -108,6 +113,7 @@ const studentFocusStatusById = reactive(new Map<string, StudentFocusStatus>());
 const studentFocusUpdatedAtById = reactive(new Map<string, number>());
 const teacherBroadcastStarting = ref(false);
 const teacherBroadcastStream = ref<MediaStream | null>(null);
+const reminderBoardSelection = ref<ReminderBoard | null>(null);
 const whiteboardDiagnosticsVisible = ref(true);
 const whiteboardDiagEventsPerSecond = ref(0);
 const whiteboardDiagBatchesPerSecond = ref(0);
@@ -175,6 +181,7 @@ let nextTeacherSequence = 1;
 let teacherBatchFlushTimer: number | null = null;
 
 let ws: WebSocket | null = null;
+let isUnmounting = false;
 let countdownTimerId: number | null = null;
 let countdownAudioContext: AudioContext | null = null;
 let whiteboardDiagWindowEvents = 0;
@@ -366,9 +373,28 @@ function syncStudentPointMapsFromClassroom(
 }
 
 function applyClassroomState(state: ClassroomStatePayload) {
+  const isNewClassroom =
+    currentClassroomId.value !== state.current_classroom.id;
   currentClassroomName.value = state.current_classroom.name;
   currentClassroomId.value = state.current_classroom.id;
   classroomStudents.value = state.students;
+
+  if (isNewClassroom) {
+    studentGroupCountInitialized.value = false;
+  }
+
+  if (!studentGroupCountInitialized.value && state.students.length > 0) {
+    let maxG = 3;
+    for (const s of state.students) {
+      if (s.group_no > maxG) {
+        maxG = s.group_no;
+      }
+    }
+    studentGroupCount.value = maxG;
+    studentGroupCountCommitted.value = maxG;
+    studentGroupCountInitialized.value = true;
+  }
+
   syncStudentPointMapsFromClassroom(state.students);
 }
 
@@ -524,6 +550,10 @@ function toActiveModule(mode: WhiteboardMode): ActiveModule {
       return "contact_book_management";
     case "student-points":
       return "student_points";
+    case "reminder-board":
+      return "reminder_board";
+    case "reminder-settings":
+      return "reminder_settings";
   }
 }
 
@@ -547,7 +577,10 @@ async function changeStudentPoints(pointId: string, delta: number) {
   }
 }
 
-async function changeMultipleStudentPoints(studentIds: number[], delta: number) {
+async function changeMultipleStudentPoints(
+  studentIds: number[],
+  delta: number,
+) {
   if (studentIds.length === 0) {
     return;
   }
@@ -1223,6 +1256,17 @@ function showRtcError(message: string) {
   rtcErrorVisible.value = true;
 }
 
+function handleConnectionFailure(reason: string) {
+  if (isUnmounting) {
+    return;
+  }
+
+  console.error(`主控端連線失敗: ${reason}`);
+  activateHome();
+  showRtcError("主控端連線失敗");
+  wsStatus.value = "主控端連線失敗";
+}
+
 function clampCountdownInputs() {
   countdownMinutesInput.value = Math.max(
     0,
@@ -1393,11 +1437,17 @@ function applyCountdownMinutePreset(minutes: number) {
   syncCountdownRemainingFromInputIfIdle();
 }
 
-function toModeMessage(): WhiteboardModeSyncMessage {
+function shouldBroadcastModeToStudents(mode: WhiteboardMode): boolean {
+  return mode !== "reminder-settings";
+}
+
+function toModeMessage(
+  mode: WhiteboardMode = activeFeature.value,
+): WhiteboardModeSyncMessage {
   return {
     kind: "mode-sync",
-    activeModule: toActiveModule(activeFeature.value),
-    mode: activeFeature.value,
+    activeModule: toActiveModule(mode),
+    mode,
     modeVersion: modeVersion.value,
     activeTab: activeWhiteboardTab.value,
     tabVersion: tabVersion.value,
@@ -1465,6 +1515,15 @@ function toStudentSwitchBoardMessage(): WhiteboardStudentSwitchBoardMessage {
   return {
     kind: "student-switch-board",
     boardTab: "student-board",
+  };
+}
+
+function toReminderBoardStateMessage(
+  board: ReminderBoard | null,
+): ReminderBoardStateMessage {
+  return {
+    kind: "reminder-board-state",
+    board,
   };
 }
 
@@ -1571,7 +1630,9 @@ function closeQuickQaQuestion(correctOptionChoice: QuickQaOption | "none") {
       quickQaStageCorrectCounts.set(studentId, currentScore + 1);
 
       if (quickQaQuestion.value.autoAddPointsForCorrect) {
-        const student = students.value.find((s) => s.connection_id === studentId);
+        const student = students.value.find(
+          (s) => s.connection_id === studentId,
+        );
         if (student && typeof student.student_id === "number") {
           correctStudentIds.push(student.student_id);
         }
@@ -1910,7 +1971,19 @@ function broadcastToLessonChannels(message: WhiteboardSyncMessage) {
 }
 
 function pushBootstrapToStudent(studentId: string) {
-  sendToStudentChannel(studentId, toModeMessage());
+  const bootstrapMode = shouldBroadcastModeToStudents(activeFeature.value)
+    ? activeFeature.value
+    : "home";
+
+  sendToStudentChannel(studentId, toModeMessage(bootstrapMode));
+
+  if (bootstrapMode === "reminder-board") {
+    sendToStudentChannel(
+      studentId,
+      toReminderBoardStateMessage(reminderBoardSelection.value),
+    );
+  }
+
   sendToStudentChannel(studentId, toTeacherSnapshotMessage("join"));
   sendToStudentChannel(
     studentId,
@@ -2084,7 +2157,10 @@ function applyFeatureMode(mode: WhiteboardMode) {
 
   activeFeature.value = mode;
   modeVersion.value += 1;
-  broadcastToLessonChannels(toModeMessage());
+
+  if (shouldBroadcastModeToStudents(mode)) {
+    broadcastToLessonChannels(toModeMessage(mode));
+  }
 }
 
 function applyWhiteboardTab(tab: WhiteboardBoardTab) {
@@ -2129,6 +2205,26 @@ function activateContactBook() {
 
 function activateStudentPoints() {
   applyFeatureMode("student-points");
+}
+
+function handleReminderBoardSelection(board: ReminderBoard | null) {
+  reminderBoardSelection.value = board;
+
+  if (activeFeature.value === "reminder-board") {
+    broadcastToLessonChannels(toReminderBoardStateMessage(board));
+  }
+}
+
+function activateReminderBoard() {
+  applyFeatureMode("reminder-board");
+}
+
+function onReminderBoardNavigate(view: string) {
+  if (view === "reminder-settings") {
+    applyFeatureMode("reminder-settings");
+  } else if (view === "main") {
+    applyFeatureMode("reminder-board");
+  }
 }
 
 function activateTeacherBoardTab() {
@@ -2476,13 +2572,18 @@ function bindLessonChannel(studentId: string, channel: RTCDataChannel) {
   };
 
   channel.onerror = () => {
-    showRtcError(`學生 ${studentId} 資料通道發生錯誤`);
+    console.error(`學生 ${studentId} 資料通道發生錯誤`);
+    handleConnectionFailure(`WebRTC 資料通道發生錯誤（學生 ${studentId}）`);
   };
 
   channel.onclose = () => {
     const current = lessonChannels.get(studentId);
     if (current === channel) {
       lessonChannels.delete(studentId);
+    }
+
+    if (channel.readyState !== "open") {
+      handleConnectionFailure(`WebRTC 資料通道已中斷（學生 ${studentId}）`);
     }
   };
 
@@ -2700,11 +2801,12 @@ function connectTeacherSocket() {
 
   ws.onclose = () => {
     wsStatus.value = "已中斷";
+    handleConnectionFailure("WebSocket 連線已中斷");
   };
 
   ws.onerror = () => {
     wsStatus.value = "發生錯誤";
-    showRtcError("WebSocket 連線發生錯誤");
+    handleConnectionFailure("WebSocket 連線發生錯誤");
   };
 
   ws.onmessage = async (event) => {
@@ -2756,6 +2858,7 @@ onMounted(() => {
 });
 
 onBeforeUnmount(() => {
+  isUnmounting = true;
   stopWhiteboardDiagnosticsTicker();
   stopTeacherBroadcastTrack();
 
@@ -2886,6 +2989,13 @@ onBeforeUnmount(() => {
         >
           學生積點
         </v-btn>
+        <v-btn
+          color="cyan"
+          :variant="activeFeature === 'reminder-board' ? 'flat' : 'outlined'"
+          @click="activateReminderBoard"
+        >
+          提醒看板
+        </v-btn>
         <v-btn color="info" variant="tonal" @click="openStudentUrlDialog">
           學生開啟網頁
         </v-btn>
@@ -2997,7 +3107,10 @@ onBeforeUnmount(() => {
       </div>
     </v-navigation-drawer>
     <v-main class="teacher-main">
-      <div class="feature-main pa-3">
+      <div
+        class="feature-main"
+        :class="{ 'pa-3': activeFeature !== 'reminder-board' }"
+      >
         <div
           v-if="activeFeature === 'contact-book'"
           class="contact-book-layout"
@@ -3771,6 +3884,21 @@ onBeforeUnmount(() => {
             </div>
           </v-card-text>
         </v-card>
+
+        <ReminderBoardView
+          v-else-if="activeFeature === 'reminder-board'"
+          class="flex-grow-1"
+          :base-url="props.baseUrl"
+          @navigate="onReminderBoardNavigate"
+          @board-selected="handleReminderBoardSelection"
+        />
+
+        <ReminderBoardSettingsView
+          v-else-if="activeFeature === 'reminder-settings'"
+          class="flex-grow-1"
+          :base-url="props.baseUrl"
+          @navigate="onReminderBoardNavigate"
+        />
 
         <v-card
           v-else

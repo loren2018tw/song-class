@@ -1365,6 +1365,118 @@ async fn update_task_submission_handler(
     Ok(Json(task))
 }
 
+async fn get_reminder_boards_handler(
+    State(state): State<HttpState>,
+) -> Result<Json<Vec<ReminderBoard>>, (StatusCode, Json<Value>)> {
+    let db_path = {
+        let guard = state.runtime.lock().await;
+        guard.db_path.clone()
+    };
+
+    let conn = Connection::open(db_path).map_err(|error| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("開啟資料庫失敗: {error}"),
+        )
+    })?;
+
+    let mut stmt = conn
+        .prepare("SELECT id, category, title, subtitle, icon FROM reminder_boards WHERE category = '自訂' ORDER BY id DESC")
+        .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    let boards = stmt
+        .query_map([], |row| {
+            Ok(ReminderBoard {
+                id: Some(row.get(0)?),
+                category: row.get(1)?,
+                title: row.get(2)?,
+                subtitle: row.get(3)?,
+                icon: row.get(4)?,
+            })
+        })
+        .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    Ok(Json(boards))
+}
+
+async fn create_reminder_board_handler(
+    State(state): State<HttpState>,
+    Json(board): Json<ReminderBoard>,
+) -> Result<Json<ReminderBoard>, (StatusCode, Json<Value>)> {
+    let db_path = {
+        let guard = state.runtime.lock().await;
+        guard.db_path.clone()
+    };
+
+    let conn = Connection::open(db_path).map_err(|error| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("開啟資料庫失敗: {error}"),
+        )
+    })?;
+
+    conn.execute(
+        "INSERT INTO reminder_boards (category, title, subtitle, icon) VALUES (?1, ?2, ?3, ?4)",
+        params![board.category, board.title, board.subtitle, board.icon],
+    )
+    .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    let id = conn.last_insert_rowid();
+    let mut new_board = board;
+    new_board.id = Some(id);
+    Ok(Json(new_board))
+}
+
+async fn update_reminder_board_handler(
+    State(state): State<HttpState>,
+    Path(id): Path<i64>,
+    Json(board): Json<ReminderBoard>,
+) -> Result<Json<()>, (StatusCode, Json<Value>)> {
+    let db_path = {
+        let guard = state.runtime.lock().await;
+        guard.db_path.clone()
+    };
+
+    let conn = Connection::open(db_path).map_err(|error| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("開啟資料庫失敗: {error}"),
+        )
+    })?;
+
+    conn.execute(
+        "UPDATE reminder_boards SET title = ?1, subtitle = ?2, icon = ?3 WHERE id = ?4",
+        params![board.title, board.subtitle, board.icon, id],
+    )
+    .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    Ok(Json(()))
+}
+
+async fn delete_reminder_board_handler(
+    State(state): State<HttpState>,
+    Path(id): Path<i64>,
+) -> Result<Json<()>, (StatusCode, Json<Value>)> {
+    let db_path = {
+        let guard = state.runtime.lock().await;
+        guard.db_path.clone()
+    };
+
+    let conn = Connection::open(db_path).map_err(|error| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("開啟資料庫失敗: {error}"),
+        )
+    })?;
+
+    conn.execute("DELETE FROM reminder_boards WHERE id = ?1", params![id])
+        .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    Ok(Json(()))
+}
+
 async fn set_task_completion_handler(
     State(state): State<HttpState>,
     Path(task_id): Path<i64>,
@@ -2826,6 +2938,14 @@ async fn start_server_impl(
             "/api/contact-book/tasks/{task_id}/completion",
             post(set_task_completion_handler),
         )
+        .route(
+            "/api/reminder-boards",
+            get(get_reminder_boards_handler).post(create_reminder_board_handler),
+        )
+        .route(
+            "/api/reminder-boards/{id}",
+            patch(update_reminder_board_handler).delete(delete_reminder_board_handler),
+        )
         .route("/health", get(health))
         .route_service(
             "/song-class.png",
@@ -2942,6 +3062,89 @@ async fn get_server_debug_info(
         teacher_redirect_url: format!("http://localhost:{DEFAULT_PORT}/teacher?base={base_url}"),
         student_redirect_url: format!("{base_url}/student"),
     })
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ReminderBoard {
+    id: Option<i64>,
+    category: String,
+    title: String,
+    subtitle: String,
+    icon: String,
+}
+
+#[tauri::command]
+async fn get_reminder_boards(
+    state: tauri::State<'_, BackendState>,
+) -> Result<Vec<ReminderBoard>, String> {
+    let runtime = state.inner.lock().await;
+    let conn = Connection::open(&runtime.db_path).map_err(|e| e.to_string())?;
+    let mut stmt = conn
+        .prepare("SELECT id, category, title, subtitle, icon FROM reminder_boards WHERE category = '自訂' ORDER BY id DESC")
+        .map_err(|e| e.to_string())?;
+
+    let boards = stmt
+        .query_map([], |row| {
+            Ok(ReminderBoard {
+                id: Some(row.get(0)?),
+                category: row.get(1)?,
+                title: row.get(2)?,
+                subtitle: row.get(3)?,
+                icon: row.get(4)?,
+            })
+        })
+        .map_err(|e| e.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?;
+
+    Ok(boards)
+}
+
+#[tauri::command]
+async fn create_reminder_board(
+    state: tauri::State<'_, BackendState>,
+    board: ReminderBoard,
+) -> Result<ReminderBoard, String> {
+    let runtime = state.inner.lock().await;
+    let conn = Connection::open(&runtime.db_path).map_err(|e| e.to_string())?;
+    conn.execute(
+        "INSERT INTO reminder_boards (category, title, subtitle, icon) VALUES (?1, ?2, ?3, ?4)",
+        params![board.category, board.title, board.subtitle, board.icon],
+    )
+    .map_err(|e| e.to_string())?;
+
+    let id = conn.last_insert_rowid();
+    let mut new_board = board;
+    new_board.id = Some(id);
+    Ok(new_board)
+}
+
+#[tauri::command]
+async fn update_reminder_board(
+    state: tauri::State<'_, BackendState>,
+    board: ReminderBoard,
+) -> Result<(), String> {
+    let id = board.id.ok_or("缺少 ID")?;
+    let runtime = state.inner.lock().await;
+    let conn = Connection::open(&runtime.db_path).map_err(|e| e.to_string())?;
+    conn.execute(
+        "UPDATE reminder_boards SET title = ?1, subtitle = ?2, icon = ?3 WHERE id = ?4",
+        params![board.title, board.subtitle, board.icon, id],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+async fn delete_reminder_board(
+    state: tauri::State<'_, BackendState>,
+    id: i64,
+) -> Result<(), String> {
+    let runtime = state.inner.lock().await;
+    let conn = Connection::open(&runtime.db_path).map_err(|e| e.to_string())?;
+    conn.execute("DELETE FROM reminder_boards WHERE id = ?1", params![id])
+        .map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 #[tauri::command]
@@ -3091,7 +3294,11 @@ pub fn run() {
             stop_server,
             get_server_info,
             get_server_debug_info,
-            get_app_version
+            get_app_version,
+            get_reminder_boards,
+            create_reminder_board,
+            update_reminder_board,
+            delete_reminder_board
         ])
         .on_window_event(|window, event| {
             if window.label() != "main" {

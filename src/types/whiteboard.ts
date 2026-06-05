@@ -19,7 +19,9 @@ export type WhiteboardMode =
   | "whiteboard"
   | "quick-qa"
   | "teacher-broadcast"
-  | "student-points";
+  | "student-points"
+  | "reminder-board"
+  | "reminder-settings";
 
 export type ActiveModule =
   | "home"
@@ -27,7 +29,9 @@ export type ActiveModule =
   | "whiteboard"
   | "quick_qa"
   | "teacher_screen_broadcast"
-  | "student_points";
+  | "student_points"
+  | "reminder_board"
+  | "reminder_settings";
 export type WhiteboardBoardTab = "teacher-board" | "student-board";
 export type QuickQaOption = "A" | "B" | "C" | "D";
 
@@ -231,6 +235,11 @@ export interface WhiteboardStudentOpenUrlMessage {
   url: string;
 }
 
+export interface ReminderBoardStateMessage {
+  kind: "reminder-board-state";
+  board: import("./reminderBoard").ReminderBoard | null;
+}
+
 export interface StudentFocusStatusMessage {
   kind: "student-focus-status";
   studentId?: string;
@@ -252,6 +261,7 @@ export type WhiteboardSyncMessage =
   | WhiteboardStudentViewControlMessage
   | WhiteboardStudentSwitchBoardMessage
   | WhiteboardStudentOpenUrlMessage
+  | ReminderBoardStateMessage
   | StudentFocusStatusMessage
   | QuickQaStateMessage
   | QuickQaAnswerSubmitMessage;
@@ -334,6 +344,7 @@ export function isWhiteboardSyncMessage(
     kind === "student-view-control" ||
     kind === "student-switch-board" ||
     kind === "student-open-url" ||
+    kind === "reminder-board-state" ||
     kind === "student-focus-status" ||
     kind === "quick-qa-state" ||
     kind === "quick-qa-answer-submit"

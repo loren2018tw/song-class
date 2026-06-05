@@ -59,6 +59,10 @@ const memberOriginalSnapshot = ref("");
 let ws: WebSocket | null = null;
 const MAX_DEBUG_LOGS = 120;
 
+defineEmits<{
+  (e: "navigate", view: string): void;
+}>();
+
 const { appVersionLabel } = useAppVersion();
 
 const consoleBackendUrl = computed(() => {

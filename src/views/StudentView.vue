@@ -2,6 +2,7 @@
 import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import RosterJoinCard from "../components/RosterJoinCard.vue";
 import WhiteboardCanvas from "../components/WhiteboardCanvas.vue";
+import ReminderBoardView from "./ReminderBoardView.vue";
 import { useAppVersion } from "../composables/useAppVersion";
 import { createPeerConnection } from "../composables/usePeerConnection";
 import type {
@@ -32,6 +33,7 @@ import {
   type WhiteboardTeacherStudentEventBatchMessage,
   type WhiteboardSyncMessage,
   type WhiteboardTeacherBoardControlMessage,
+  type ReminderBoardStateMessage,
 } from "../types/whiteboard";
 
 const props = defineProps<{
@@ -77,6 +79,9 @@ const teacherBroadcastStream = ref<MediaStream | null>(null);
 const modeVersion = ref(0);
 const tabVersion = ref(0);
 const quickQaQuestion = ref<QuickQaQuestion | null>(null);
+const reminderBoardState = ref<
+  import("../types/reminderBoard").ReminderBoard | null
+>(null);
 
 const teacherSnapshot = ref<WhiteboardSnapshot>(
   createEmptyWhiteboardSnapshot(),
@@ -517,6 +522,12 @@ function fromActiveModule(activeModule: ActiveModule): WhiteboardMode {
     case "teacher_screen_broadcast":
       return "teacher-broadcast";
     case "student_points":
+      return "home";
+    case "reminder_board":
+      return "reminder-board";
+    case "reminder_settings":
+      return "reminder-board";
+    default:
       return "home";
   }
 }
@@ -1198,6 +1209,12 @@ function handleLessonMessage(raw: string) {
     return;
   }
 
+  if (parsed.kind === "reminder-board-state") {
+    const reminderBoardMessage = parsed as ReminderBoardStateMessage;
+    reminderBoardState.value = reminderBoardMessage.board;
+    return;
+  }
+
   if (parsed.kind === "mode-sync") {
     if (parsed.modeVersion < modeVersion.value) {
       return;
@@ -1735,6 +1752,18 @@ onBeforeUnmount(() => {
       </div>
 
       <div
+        v-else-if="activeMode === 'reminder-board'"
+        class="student-reminder-board-screen"
+      >
+        <ReminderBoardView
+          class="student-reminder-board"
+          :base-url="props.baseUrl"
+          :readonly="true"
+          :board="reminderBoardState"
+        />
+      </div>
+
+      <div
         v-else-if="activeMode === 'teacher-broadcast'"
         class="student-broadcast-screen"
       >
@@ -1842,6 +1871,18 @@ onBeforeUnmount(() => {
   padding: 10px;
   box-sizing: border-box;
   overflow: hidden;
+}
+
+.student-reminder-board-screen {
+  height: 100%;
+  max-height: 100%;
+  padding: 10px;
+  box-sizing: border-box;
+  overflow: hidden;
+}
+
+.student-reminder-board {
+  height: 100%;
 }
 
 .student-broadcast-shell {
