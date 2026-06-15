@@ -6,6 +6,7 @@ use axum::http::{HeaderMap, HeaderValue};
 use axum::response::{IntoResponse, Redirect};
 use axum::routing::{get, patch, post};
 use axum::{Json, Router};
+use chrono::Local;
 use futures_util::{SinkExt, StreamExt};
 use local_ip_address::local_ip;
 use rusqlite::{params, params_from_iter, types::Value as SqlValue, Connection, OptionalExtension};
@@ -15,9 +16,9 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
-use tauri::menu::{Menu, MenuItem};
+use tauri::menu::{Menu, MenuBuilder, MenuItem, SubmenuBuilder};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
-use tauri::Manager;
+use tauri::{Emitter, Manager};
 use tokio::net::TcpListener;
 use tokio::sync::{mpsc, oneshot, Mutex};
 use tower_http::cors::{Any, CorsLayer};
@@ -3032,6 +3033,70 @@ async fn get_server_info(state: tauri::State<'_, BackendState>) -> Result<Server
 }
 
 #[tauri::command]
+async fn backup_database(
+    state: tauri::State<'_, BackendState>,
+    destination_dir: String,
+) -> Result<String, String> {
+    let db_path = {
+        let guard = state.inner.lock().await;
+        guard.db_path.clone()
+    };
+
+    if !db_path.exists() {
+        return Err("目前資料庫檔案不存在，無法備份。".to_string());
+    }
+
+    let destination = PathBuf::from(destination_dir);
+    fs::create_dir_all(&destination).map_err(|error| format!("建立備份目錄失敗: {error}"))?;
+
+    let timestamp = Local::now().format("%Y%m%d%H%M%S").to_string();
+    let backup_path = destination.join(format!("song-class-backup-{timestamp}.sqlite3"));
+
+    fs::copy(&db_path, &backup_path).map_err(|error| format!("備份資料庫失敗: {error}"))?;
+
+    Ok(backup_path.to_string_lossy().to_string())
+}
+
+#[tauri::command]
+async fn restore_database(
+    state: tauri::State<'_, BackendState>,
+    source_path: String,
+) -> Result<(), String> {
+    let source = PathBuf::from(source_path);
+    let db_path = {
+        let guard = state.inner.lock().await;
+        guard.db_path.clone()
+    };
+
+    if !source.exists() {
+        return Err("選擇的資料庫檔案不存在。".to_string());
+    }
+
+    if source == db_path {
+        return Err("不能回存到目前正在使用的資料庫檔案。".to_string());
+    }
+
+    let _ = stop_server_impl(state.inner.clone()).await?;
+
+    fs::copy(&source, &db_path).map_err(|error| format!("回存資料庫失敗: {error}"))?;
+
+    let current_classroom_id = init_database(&db_path)?;
+
+    {
+        let mut guard = state.inner.lock().await;
+        guard.current_classroom_id = current_classroom_id;
+    }
+
+    let runtime = state.inner.clone();
+    let app_version = state.app_version.clone();
+    tauri::async_runtime::spawn(async move {
+        let _ = start_server_impl(runtime, app_version).await;
+    });
+
+    Ok(())
+}
+
+#[tauri::command]
 async fn get_server_debug_info(
     state: tauri::State<'_, BackendState>,
 ) -> Result<ServerDebugInfo, String> {
@@ -3211,7 +3276,19 @@ fn restore_main_window(app: &tauri::AppHandle) {
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
+            let backup_item =
+                MenuItem::with_id(app, "backup-database", "備份資料庫", true, None::<&str>)?;
+            let restore_item =
+                MenuItem::with_id(app, "restore-database", "回存資料庫", true, None::<&str>)?;
+            let file_menu = SubmenuBuilder::new(app, "檔案")
+                .item(&backup_item)
+                .item(&restore_item)
+                .build()?;
+            let menu = MenuBuilder::new(app).item(&file_menu).build()?;
+            app.set_menu(menu)?;
+
             let show_item =
                 MenuItem::with_id(app, "show-main-window", "顯示主視窗", true, None::<&str>)?;
             let exit_item = MenuItem::with_id(app, "exit", "結束程式", true, None::<&str>)?;
@@ -3251,6 +3328,16 @@ pub fn run() {
             if let Some(tray_icon) = app.default_window_icon().cloned() {
                 tray_builder = tray_builder.icon(tray_icon);
             }
+
+            app.on_menu_event(|app, event| match event.id().as_ref() {
+                "backup-database" => {
+                    let _ = app.emit("menu-backup-database", ());
+                }
+                "restore-database" => {
+                    let _ = app.emit("menu-restore-database", ());
+                }
+                _ => {}
+            });
 
             tray_builder.build(app)?;
 
@@ -3293,6 +3380,8 @@ pub fn run() {
             start_server,
             stop_server,
             get_server_info,
+            backup_database,
+            restore_database,
             get_server_debug_info,
             get_app_version,
             get_reminder_boards,

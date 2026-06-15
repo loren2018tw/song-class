@@ -673,7 +673,7 @@ onMounted(async () => {
 }
 
 .contact-book-date-title {
-  font-size: 2rem;
+  font-size: 2.4rem;
   font-weight: 700;
   letter-spacing: 0.05em;
   margin-bottom: 12px;
@@ -689,8 +689,8 @@ onMounted(async () => {
 }
 
 .contact-book-entry-text {
-  font-size: 1.15rem;
-  line-height: 1.4;
+  font-size: 3rem;
+  line-height: 1.2;
 }
 
 .contact-book-empty {

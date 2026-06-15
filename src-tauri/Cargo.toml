@@ -36,3 +36,5 @@ uuid = { version = "1.23.1", features = ["v4", "serde"] }
 futures-util = "0.3.32"
 tokio-stream = "0.1.18"
 rusqlite = { version = "0.32", features = ["bundled"] }
+tauri-plugin-dialog = "2.7.1"
+chrono = "0.4"

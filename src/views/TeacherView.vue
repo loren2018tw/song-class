@@ -1,5 +1,8 @@
 <script setup lang="ts">
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
+import { appDataDir } from "@tauri-apps/api/path";
+import { ask, message, open as openDialog } from "@tauri-apps/plugin-dialog";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { computed, onBeforeUnmount, onMounted, ref } from "vue";
 import StudentListCard from "../components/StudentListCard.vue";
@@ -57,6 +60,8 @@ const memberRows = ref<EditableMemberRow[]>([]);
 const memberOriginalSnapshot = ref("");
 
 let ws: WebSocket | null = null;
+let unlistenBackupMenu: (() => void) | null = null;
+let unlistenRestoreMenu: (() => void) | null = null;
 const MAX_DEBUG_LOGS = 120;
 
 defineEmits<{
@@ -253,6 +258,69 @@ async function openTeacherInBrowser() {
     await openUrl(teacherBrowserUrl.value);
   } catch (error) {
     actionError.value = `開啟教師端失敗: ${String(error)}`;
+    appendLog(actionError.value, "error");
+  }
+}
+
+async function backupDatabase() {
+  try {
+    const destinationDir = await openDialog({
+      directory: true,
+      multiple: false,
+      title: "選擇備份資料庫位置",
+      defaultPath: await appDataDir(),
+    });
+
+    if (!destinationDir) {
+      return;
+    }
+
+    const backupPath = await invoke<string>("backup_database", {
+      destinationDir,
+    });
+    await message(`備份完成：${backupPath}`, {
+      title: "備份資料庫",
+      kind: "info",
+    });
+    actionError.value = "";
+    appendLog(`backup_database: ${backupPath}`);
+  } catch (error) {
+    actionError.value = `備份資料庫失敗: ${String(error)}`;
+    appendLog(actionError.value, "error");
+  }
+}
+
+async function restoreDatabase() {
+  const confirmed = await ask("回存資料庫會覆蓋目前資料庫資料，是否繼續？", {
+    title: "警告",
+    kind: "warning",
+    okLabel: "繼續",
+    cancelLabel: "取消",
+  });
+
+  if (!confirmed) {
+    return;
+  }
+
+  try {
+    const sourcePath = await openDialog({
+      title: "選擇要回存的資料庫檔案",
+      defaultPath: await appDataDir(),
+      filters: [
+        { name: "SQLite 資料庫", extensions: ["sqlite", "sqlite3", "db"] },
+      ],
+    });
+
+    if (!sourcePath) {
+      return;
+    }
+
+    await invoke("restore_database", { sourcePath });
+    await refreshClassroomState();
+    actionError.value = "";
+    appendLog(`restore_database: ${sourcePath}`);
+  } catch (error) {
+    actionError.value = `回存資料庫失敗: ${String(error)}`;
     appendLog(actionError.value, "error");
   }
 }
@@ -484,21 +552,30 @@ onMounted(async () => {
   connectConsoleSocket();
   appendLog(`route_teacher=${importantRoutes.value.appTeacher}`);
   appendLog(`route_student=${importantRoutes.value.appStudent}`);
+
+  unlistenBackupMenu = await listen("menu-backup-database", () => {
+    void backupDatabase();
+  });
+  unlistenRestoreMenu = await listen("menu-restore-database", () => {
+    void restoreDatabase();
+  });
 });
 
 onBeforeUnmount(() => {
   if (ws) {
     ws.close();
   }
+  unlistenBackupMenu?.();
+  unlistenRestoreMenu?.();
 });
 </script>
 
 <template>
-  <v-container class="py-8">
-    <v-row class="mb-4">
+  <v-container class="pt-2 pb-8">
+    <v-row class="mb-2">
       <v-col cols="12" class="d-flex justify-space-between align-center">
         <div>
-          <h1 class="text-h4 font-weight-black">後端主控台</h1>
+          <h1 class="text-h4 font-weight-black mt-0">後端主控台</h1>
           <p class="text-medium-emphasis mb-0">WebSocket: {{ wsStatus }}</p>
           <p class="text-medium-emphasis mb-0">
             目前班級: {{ classroomState?.current_classroom.name ?? "載入中" }}

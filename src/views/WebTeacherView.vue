@@ -2909,12 +2909,13 @@ onBeforeUnmount(() => {
 
 <template>
   <v-app>
-    <v-app-bar title="song-class(教師端)">
-      <template #prepend>
-        <div class="pl-3 text-caption text-medium-emphasis">
+    <v-app-bar>
+      <v-app-bar-title>
+        song-class(教師端)
+        <span class="text-caption text-medium-emphasis ml-4">
           目前班級: {{ currentClassroomName }}
-        </div>
-      </template>
+        </span>
+      </v-app-bar-title>
       <template #append>
         <div class="student-join-qr-wrap">
           <span class="student-join-qr-text">學生端連結</span>
