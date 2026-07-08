@@ -2,23 +2,22 @@ schema: spec-driven
 
 context: |
   語言：繁體中文
-  所有產生的規劃書文件除專有名詞外必須使用繁體中文撰寫。
+  除專有名詞與既有英文產品名外，所有產出內容均須使用繁體中文撰寫。
+  文件應先說明目標與範圍，再明確定義資料結構、狀態流、事件流、相依關係與驗收條件。
+  若需求涉及使用者互動，必須補充完整互動情境、觸發條件、系統回應與例外處理。
+  若需求涉及介面，必要時需詳細描述 UI 設計、使用元件、元件狀態、資訊層級與畫面位置。
 
-# Project context (optional)
-# This is shown to AI when creating artifacts.
-# Add your tech stack, conventions, style guides, domain knowledge, etc.
-# Example:
-#   context: |
-#     Tech stack: TypeScript, React, Node.js
-#     We use conventional commits
-#     Domain: e-commerce platform
-
-# Per-artifact rules (optional)
-# Add custom rules for specific artifacts.
-# Example:
-#   rules:
-#     proposal:
-#       - Keep proposals under 500 words
-#       - Always include a "Non-goals" section
-#     tasks:
-#       - Break tasks into chunks of max 2 hours
+rules:
+  proposal:
+    - 以繁體中文撰寫，並清楚說明問題背景、目標、非目標、影響範圍與主要風險。
+    - 若需求涉及資料保存、同步或狀態轉換，需先概述資料結構與資料流。
+  spec:
+    - 必須描述完整資料結構，包含欄位意義、型別、預設值、關聯與限制條件。
+    - 必須描述使用者互動情境，包含操作步驟、觸發條件、畫面回饋與錯誤情境。
+    - 若涉及 UI，需在必要時詳細描述畫面配置、元件選擇、元件狀態、按鈕位置與主要資訊區塊。
+  design:
+    - 必須延續 spec 的資料與互動定義，補足實作所需的畫面流程與元件配置。
+    - 若涉及 UI，需明確標示各區塊用途、元件擺放位置與可見狀態差異。
+  tasks:
+    - 將工作拆成可驗證的小步驟，依賴關係與驗收方式需明確。
+    - 若有資料結構變更，需將 migration 或資料遷移工作納入任務。
