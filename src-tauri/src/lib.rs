@@ -4,9 +4,9 @@ use axum::http::header::{ACCESS_CONTROL_ALLOW_ORIGIN, HOST};
 use axum::http::StatusCode;
 use axum::http::{HeaderMap, HeaderValue};
 use axum::response::{IntoResponse, Redirect};
-use axum::routing::{get, patch, post};
+use axum::routing::{delete, get, patch, post};
 use axum::{Json, Router};
-use chrono::Local;
+use chrono::{Datelike, Local};
 use futures_util::{SinkExt, StreamExt};
 use local_ip_address::local_ip;
 use rusqlite::{params, params_from_iter, types::Value as SqlValue, Connection, OptionalExtension};
@@ -132,6 +132,12 @@ struct SessionHub {
 struct ClassroomSummary {
     id: i64,
     name: String,
+    line_enabled: bool,
+    #[serde(serialize_with = "mask_sensitive")]
+    line_channel_access_token: String,
+    #[serde(serialize_with = "mask_sensitive")]
+    line_channel_secret: String,
+    line_rich_menu_id: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -245,6 +251,12 @@ struct SelectClassroomRequest {
 #[derive(Debug, Deserialize)]
 struct UpdateClassroomRequest {
     name: String,
+    #[serde(default)]
+    line_enabled: Option<bool>,
+    #[serde(default)]
+    line_channel_access_token: Option<String>,
+    #[serde(default)]
+    line_channel_secret: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -615,7 +627,11 @@ fn init_database(db_path: &PathBuf) -> Result<i64, String> {
 
 fn load_classrooms(conn: &Connection) -> Result<Vec<ClassroomSummary>, String> {
     let mut statement = conn
-        .prepare("SELECT id, name FROM classrooms ORDER BY id ASC")
+        .prepare(
+            "SELECT id, name, line_enabled, line_channel_access_token, \
+             line_channel_secret, line_rich_menu_id \
+             FROM classrooms ORDER BY id ASC",
+        )
         .map_err(|error| format!("準備班級查詢失敗: {error}"))?;
 
     let rows = statement
@@ -623,6 +639,10 @@ fn load_classrooms(conn: &Connection) -> Result<Vec<ClassroomSummary>, String> {
             Ok(ClassroomSummary {
                 id: row.get(0)?,
                 name: row.get(1)?,
+                line_enabled: row.get::<_, i64>(2)? != 0,
+                line_channel_access_token: row.get(3)?,
+                line_channel_secret: row.get(4)?,
+                line_rich_menu_id: row.get(5)?,
             })
         })
         .map_err(|error| format!("查詢班級清單失敗: {error}"))?;
@@ -1057,6 +1077,21 @@ fn api_error(status: StatusCode, message: impl Into<String>) -> (StatusCode, Jso
     let message = message.into();
     eprintln!("[api-error] {status}: {message}");
     (status, Json(json!({ "message": message })))
+}
+
+fn mask_sensitive<S: serde::Serializer>(value: &str, serializer: S) -> Result<S::Ok, S::Error> {
+    let masked = if value.len() > 8 {
+        format!("{}****", &value[..4])
+    } else if !value.is_empty() {
+        "****".to_string()
+    } else {
+        value.to_string()
+    };
+    serializer.serialize_str(&masked)
+}
+
+fn is_masked(value: &str) -> bool {
+    value.contains("****")
 }
 
 async fn get_classroom_state_handler(
@@ -1654,6 +1689,7 @@ async fn update_classroom_handler(
             format!("開啟資料庫失敗: {error}"),
         )
     })?;
+
     let updated = conn
         .execute(
             "UPDATE classrooms SET name = ?1 WHERE id = ?2",
@@ -1667,6 +1703,49 @@ async fn update_classroom_handler(
         })?;
     if updated == 0 {
         return Err(api_error(StatusCode::NOT_FOUND, "指定班級不存在"));
+    }
+
+    if let Some(enabled) = body.line_enabled {
+        conn.execute(
+            "UPDATE classrooms SET line_enabled = ?1 WHERE id = ?2",
+            params![enabled as i64, classroom_id],
+        )
+        .map_err(|error| {
+            api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("更新 LINE 啟用設定失敗: {error}"),
+            )
+        })?;
+    }
+
+    if let Some(token) = body.line_channel_access_token {
+        if !token.is_empty() && !is_masked(&token) {
+            conn.execute(
+                "UPDATE classrooms SET line_channel_access_token = ?1 WHERE id = ?2",
+                params![token, classroom_id],
+            )
+            .map_err(|error| {
+                api_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("更新 LINE token 失敗: {error}"),
+                )
+            })?;
+        }
+    }
+
+    if let Some(secret) = body.line_channel_secret {
+        if !secret.is_empty() && !is_masked(&secret) {
+            conn.execute(
+                "UPDATE classrooms SET line_channel_secret = ?1 WHERE id = ?2",
+                params![secret, classroom_id],
+            )
+            .map_err(|error| {
+                api_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("更新 LINE secret 失敗: {error}"),
+                )
+            })?;
+        }
     }
 
     broadcast_classroom_state(&runtime).await;
@@ -2806,6 +2885,516 @@ async fn handle_socket(
     writer_task.abort();
 }
 
+const LINE_RICHMENU_MAX_ACTION_TEXT: usize = 300;
+const LINE_API_BASE: &str = "https://api.line.me/v2/bot";
+const LINE_API_DATA_BASE: &str = "https://api-data.line.me/v2/bot";
+
+#[derive(Debug, Deserialize)]
+struct SyncTaskItem {
+    title: String,
+    task_date: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct SyncToLineRequest {
+    tasks: Vec<SyncTaskItem>,
+}
+
+#[derive(Debug, Serialize)]
+struct SyncToLineResponse {
+    success: bool,
+    rich_menu_id: String,
+    message: String,
+    summarized: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct LineRichMenuItem {
+    rich_menu_id: String,
+    name: String,
+    chat_bar_text: String,
+    selected: bool,
+}
+
+fn get_line_client_and_token(
+    conn: &Connection,
+    classroom_id: i64,
+) -> Result<(reqwest::Client, String), (StatusCode, Json<Value>)> {
+    let classroom = conn
+        .query_row(
+            "SELECT line_enabled, line_channel_access_token \
+             FROM classrooms WHERE id = ?1",
+            params![classroom_id],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(|error| {
+            api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("讀取班級資訊失敗: {error}"),
+            )
+        })?
+        .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "指定班級不存在"))?;
+
+    let (enabled, token) = classroom;
+
+    if enabled == 0 {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "該班級未啟用 LINE 同步功能",
+        ));
+    }
+
+    if token.is_empty() {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "該班級未設定 LINE Channel Access Token",
+        ));
+    }
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
+        .map_err(|error| {
+            api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("建立 HTTP client 失敗: {error}"),
+            )
+        })?;
+
+    Ok((client, token))
+}
+
+async fn list_line_richmenus_handler(
+    State(state): State<HttpState>,
+    Path(classroom_id): Path<i64>,
+) -> Result<Json<Vec<LineRichMenuItem>>, (StatusCode, Json<Value>)> {
+    let runtime = state.runtime.clone();
+    let db_path = { runtime.lock().await.db_path.clone() };
+    let conn = Connection::open(db_path).map_err(|error| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("開啟資料庫失敗: {error}"),
+        )
+    })?;
+
+    let (client, token) = get_line_client_and_token(&conn, classroom_id)?;
+    let auth_header = format!("Bearer {}", token);
+
+    let resp = client
+        .get(format!("{}/richmenu/list", LINE_API_BASE))
+        .header("Authorization", &auth_header)
+        .send()
+        .await
+        .map_err(|error| {
+            api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("查詢 LINE rich menu 列表失敗: {error}"),
+            )
+        })?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        return Err(api_error(
+            StatusCode::BAD_GATEWAY,
+            format!("LINE API 查詢 rich menu 列表錯誤：HTTP {status}: {body}"),
+        ));
+    }
+
+    let list_body: Value = resp.json().await.map_err(|error| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("解析 LINE API 回覆失敗: {error}"),
+        )
+    })?;
+
+    let menus = list_body["richmenus"]
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .map(|item| LineRichMenuItem {
+                    rich_menu_id: item["richMenuId"]
+                        .as_str()
+                        .unwrap_or("")
+                        .to_string(),
+                    name: item["name"].as_str().unwrap_or("").to_string(),
+                    chat_bar_text: item["chatBarText"]
+                        .as_str()
+                        .unwrap_or("")
+                        .to_string(),
+                    selected: item["selected"].as_bool().unwrap_or(false),
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    Ok(Json(menus))
+}
+
+async fn delete_line_richmenu_handler(
+    State(state): State<HttpState>,
+    Path((classroom_id, rich_menu_id)): Path<(i64, String)>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let runtime = state.runtime.clone();
+    let db_path = { runtime.lock().await.db_path.clone() };
+    let conn = Connection::open(db_path).map_err(|error| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("開啟資料庫失敗: {error}"),
+        )
+    })?;
+
+    let (client, token) = get_line_client_and_token(&conn, classroom_id)?;
+    let auth_header = format!("Bearer {}", token);
+
+    let resp = client
+        .delete(format!("{}/richmenu/{}", LINE_API_BASE, rich_menu_id))
+        .header("Authorization", &auth_header)
+        .send()
+        .await
+        .map_err(|error| {
+            api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("刪除 rich menu 失敗: {error}"),
+            )
+        })?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        return Err(api_error(
+            StatusCode::BAD_GATEWAY,
+            format!("LINE API 拒絕刪除 rich menu：HTTP {status}: {body}"),
+        ));
+    }
+
+    // Also clear the stored rich_menu_id if it matches
+    let _ = conn.execute(
+        "UPDATE classrooms SET line_rich_menu_id = '' \
+         WHERE id = ?1 AND line_rich_menu_id = ?2",
+        params![classroom_id, rich_menu_id],
+    );
+
+    Ok(Json(json!({ "success": true })))
+}
+
+fn generate_rich_menu_json(sync_text: &str) -> Value {
+    json!({
+        "size": { "width": 2500, "height": 1686 },
+        "selected": true,
+        "name": "聯絡簿同步",
+        "chatBarText": "聯絡簿",
+        "areas": [
+            {
+                "bounds": { "x": 0, "y": 0, "width": 2500, "height": 1686 },
+                "action": {
+                    "type": "message",
+                    "text": sync_text
+                }
+            }
+        ]
+    })
+}
+
+const DEFAULT_RICHMENU_PNG: &[u8] =
+    include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/assets/default_richmenu.png"));
+
+fn format_date_weekday(iso_date: &str) -> String {
+    if let Ok(d) = chrono::NaiveDate::parse_from_str(iso_date, "%Y-%m-%d") {
+        match d.format("%w").to_string().as_str() {
+            "0" => format!("{}/{} (日)", d.month(), d.day()),
+            "1" => format!("{}/{} (一)", d.month(), d.day()),
+            "2" => format!("{}/{} (二)", d.month(), d.day()),
+            "3" => format!("{}/{} (三)", d.month(), d.day()),
+            "4" => format!("{}/{} (四)", d.month(), d.day()),
+            "5" => format!("{}/{} (五)", d.month(), d.day()),
+            "6" => format!("{}/{} (六)", d.month(), d.day()),
+            _ => iso_date.to_string(),
+        }
+    } else {
+        iso_date.to_string()
+    }
+}
+
+fn build_sync_text(tasks: &[SyncTaskItem]) -> (String, bool) {
+    let all_same_date = tasks
+        .first()
+        .map(|first| tasks.iter().all(|t| t.task_date == first.task_date))
+        .unwrap_or(true);
+
+    let mut text = if all_same_date {
+        if let Some(first) = tasks.first() {
+            format!(
+                "=== 聯絡簿 ({}) ===\n",
+                format_date_weekday(&first.task_date)
+            )
+        } else {
+            "=== 聯絡簿 ===\n".to_string()
+        }
+    } else {
+        "=== 聯絡簿 ===\n".to_string()
+    };
+
+    let mut current_date = String::new();
+    for (i, task) in tasks.iter().enumerate() {
+        if !all_same_date && task.task_date != current_date {
+            let date_line = format!("{}\n", format_date_weekday(&task.task_date));
+            if text.len() + date_line.len() > LINE_RICHMENU_MAX_ACTION_TEXT {
+                text.push_str(&format!("…等共 {} 項", tasks.len()));
+                return (text, true);
+            }
+            text.push_str(&date_line);
+            current_date = task.task_date.clone();
+        }
+
+        let truncated: String = task.title.chars().take(60).collect();
+        let line = if task.title.len() > 180 {
+            format!("{}. {}…\n", i + 1, truncated)
+        } else {
+            format!("{}. {}\n", i + 1, task.title)
+        };
+        if text.len() + line.len() > LINE_RICHMENU_MAX_ACTION_TEXT {
+            text.push_str(&format!("…等共 {} 項", tasks.len()));
+            return (text, true);
+        }
+        text.push_str(&line);
+    }
+    (text, false)
+}
+
+async fn sync_to_line_handler(
+    State(state): State<HttpState>,
+    Path(classroom_id): Path<i64>,
+    Json(body): Json<SyncToLineRequest>,
+) -> Result<Json<SyncToLineResponse>, (StatusCode, Json<Value>)> {
+    if body.tasks.is_empty() {
+        return Err(api_error(StatusCode::BAD_REQUEST, "同步內容不可為空"));
+    }
+
+    let runtime = state.runtime.clone();
+    let db_path = {
+        let guard = runtime.lock().await;
+        guard.db_path.clone()
+    };
+    let conn = Connection::open(db_path).map_err(|error| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("開啟資料庫失敗: {error}"),
+        )
+    })?;
+
+    let classroom = conn
+        .query_row(
+            "SELECT id, line_enabled, line_channel_access_token, line_channel_secret, \
+             line_rich_menu_id FROM classrooms WHERE id = ?1",
+            params![classroom_id],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(|error| {
+            api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("讀取班級資訊失敗: {error}"),
+            )
+        })?
+        .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "指定班級不存在"))?;
+
+    let (_id, enabled, token, _secret, old_rich_menu_id) = classroom;
+
+    if enabled == 0 {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "該班級未啟用 LINE 同步功能，請先在班級設定中啟用",
+        ));
+    }
+
+    if token.is_empty() {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "該班級未設定 LINE Channel Access Token",
+        ));
+    }
+
+    let (sync_text, summarized) = build_sync_text(&body.tasks);
+    let rich_menu_json = generate_rich_menu_json(&sync_text);
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .map_err(|error| {
+            api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("建立 HTTP client 失敗: {error}"),
+            )
+        })?;
+
+    let auth_header = format!("Bearer {}", token);
+
+    if !old_rich_menu_id.is_empty() {
+        let _ = client
+            .delete(format!(
+                "{}/richmenu/{}",
+                LINE_API_BASE, old_rich_menu_id
+            ))
+            .header("Authorization", &auth_header)
+            .send()
+            .await;
+    }
+
+    let create_resp = client
+        .post(format!("{}/richmenu", LINE_API_BASE))
+        .header("Authorization", &auth_header)
+        .json(&rich_menu_json)
+        .send()
+        .await
+        .map_err(|error| {
+            api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("呼叫 LINE API 建立 rich menu 失敗: {error}"),
+            )
+        })?;
+
+    if !create_resp.status().is_success() {
+        let status = create_resp.status();
+        let error_body = create_resp.text().await.unwrap_or_default();
+        let detail = if error_body.is_empty() {
+            format!("HTTP {status}（無錯誤內容）")
+        } else if let Ok(json) = serde_json::from_str::<Value>(&error_body) {
+            if let Some(msg) = json.get("message").and_then(|v| v.as_str()) {
+                format!("HTTP {status}: {msg}")
+            } else {
+                format!("HTTP {status}: {error_body}")
+            }
+        } else {
+            format!("HTTP {status}: {error_body}")
+        };
+        return Err(api_error(
+            StatusCode::BAD_GATEWAY,
+            format!("LINE API 建立 rich menu 錯誤：{detail}"),
+        ));
+    }
+
+    let create_body: Value = create_resp.json().await.map_err(|error| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("解析 LINE API 回覆失敗: {error}"),
+        )
+    })?;
+
+    let new_rich_menu_id = create_body["richMenuId"]
+        .as_str()
+        .ok_or_else(|| api_error(StatusCode::INTERNAL_SERVER_ERROR, "LINE API 未回傳 richMenuId"))?
+        .to_string();
+
+    let png_data = DEFAULT_RICHMENU_PNG.to_vec();
+    let img_resp = client
+        .post(format!(
+            "{}/richmenu/{}/content",
+            LINE_API_DATA_BASE, new_rich_menu_id
+        ))
+        .header("Authorization", &auth_header)
+        .header("Content-Type", "image/png")
+        .body(png_data)
+        .send()
+        .await
+        .map_err(|error| {
+            api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("上傳 rich menu 圖片失敗: {error}"),
+            )
+        })?;
+
+    if !img_resp.status().is_success() {
+        let status = img_resp.status();
+        let error_body = img_resp.text().await.unwrap_or_default();
+        let detail = if error_body.is_empty() {
+            format!("HTTP {status}（無錯誤內容）")
+        } else if let Ok(json) = serde_json::from_str::<Value>(&error_body) {
+            if let Some(msg) = json.get("message").and_then(|v| v.as_str()) {
+                format!("HTTP {status}: {msg}")
+            } else {
+                format!("HTTP {status}: {error_body}")
+            }
+        } else {
+            format!("HTTP {status}: {error_body}")
+        };
+        return Err(api_error(
+            StatusCode::BAD_GATEWAY,
+            format!("LINE API 拒絕 rich menu 圖片：{detail}"),
+        ));
+    }
+
+    let default_resp = client
+        .post(format!(
+            "{}/user/all/richmenu/{}",
+            LINE_API_BASE, new_rich_menu_id
+        ))
+        .header("Authorization", &auth_header)
+        .header("Content-Length", "0")
+        .send()
+        .await
+        .map_err(|error| {
+            api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("設定預設 rich menu 失敗: {error}"),
+            )
+        })?;
+
+    if !default_resp.status().is_success() {
+        let status = default_resp.status();
+        let error_body = default_resp.text().await.unwrap_or_default();
+        let detail = if error_body.is_empty() {
+            format!("HTTP {status}（無錯誤內容）")
+        } else if let Ok(json) = serde_json::from_str::<Value>(&error_body) {
+            if let Some(msg) = json.get("message").and_then(|v| v.as_str()) {
+                format!("HTTP {status}: {msg}")
+            } else {
+                format!("HTTP {status}: {error_body}")
+            }
+        } else {
+            format!("HTTP {status}: {error_body}")
+        };
+        return Err(api_error(
+            StatusCode::BAD_GATEWAY,
+            format!("LINE API 拒絕設定預設 rich menu：{detail}"),
+        ));
+    }
+
+    if let Err(error) = conn.execute(
+        "UPDATE classrooms SET line_rich_menu_id = ?1 WHERE id = ?2",
+        params![new_rich_menu_id, classroom_id],
+    ) {
+        eprintln!("[line-sync] 儲存 richMenuId 失敗: {error}");
+    }
+
+    broadcast_classroom_state(&runtime).await;
+
+    Ok(Json(SyncToLineResponse {
+        success: true,
+        rich_menu_id: new_rich_menu_id,
+        message: if summarized {
+            format!("同步成功（已自動摘要為 {} 字）", sync_text.len())
+        } else {
+            "同步成功".to_string()
+        },
+        summarized,
+    }))
+}
+
 async fn start_server_impl(
     runtime: Arc<Mutex<BackendRuntime>>,
     runtime_app_version: String,
@@ -2938,6 +3527,18 @@ async fn start_server_impl(
         .route(
             "/api/contact-book/tasks/{task_id}/completion",
             post(set_task_completion_handler),
+        )
+        .route(
+            "/api/contact-book/sync-to-line/{classroom_id}",
+            post(sync_to_line_handler),
+        )
+        .route(
+            "/api/contact-book/line-richmenus/{classroom_id}",
+            get(list_line_richmenus_handler),
+        )
+        .route(
+            "/api/contact-book/line-richmenus/{classroom_id}/{rich_menu_id}",
+            delete(delete_line_richmenu_handler),
         )
         .route(
             "/api/reminder-boards",
@@ -3643,6 +4244,194 @@ mod tests {
 
         assert_eq!(has_group_no, 1, "students should have group_no column");
         assert_eq!(has_points, 1, "students should have points column");
+
+        let _ = fs::remove_file(db_path);
+    }
+
+    #[test]
+    fn line_settings_migration_adds_columns() {
+        let db_path = make_temp_db_path();
+        let conn = Connection::open(&db_path).expect("open sqlite database");
+        let (_, baseline_sql) = baseline_migration().expect("read baseline migration");
+        conn.execute_batch(baseline_sql).expect("apply baseline");
+
+        conn.execute_batch(include_str!("../sql/migrations/003_add_line_settings.sql"))
+            .expect("apply line settings migration");
+
+        for col in &[
+            "line_enabled",
+            "line_channel_access_token",
+            "line_channel_secret",
+            "line_rich_menu_id",
+        ] {
+            let count: i64 = conn
+                .query_row(
+                    "SELECT COUNT(1) FROM pragma_table_info('classrooms') WHERE name = ?1",
+                    params![col],
+                    |row| row.get(0),
+                )
+                .expect("query column existence");
+            assert_eq!(count, 1, "classrooms should have column {col}");
+        }
+
+        conn.execute(
+            "INSERT INTO classrooms (name) VALUES (?1)",
+            params!["測試班級"],
+        )
+        .expect("insert classroom");
+        let row: (i64, String, String, String) = conn
+            .query_row(
+                "SELECT line_enabled, line_channel_access_token, line_channel_secret, \
+                 line_rich_menu_id FROM classrooms WHERE name = ?1",
+                params!["測試班級"],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                },
+            )
+            .expect("query line defaults");
+        assert_eq!(row.0, 0, "line_enabled should default to 0");
+        assert_eq!(row.1, "", "line_channel_access_token should default to empty");
+        assert_eq!(row.2, "", "line_channel_secret should default to empty");
+        assert_eq!(row.3, "", "line_rich_menu_id should default to empty");
+
+        let _ = fs::remove_file(db_path);
+    }
+
+    fn make_items(titles: &[&str], date: &str) -> Vec<SyncTaskItem> {
+        titles
+            .iter()
+            .map(|t| SyncTaskItem {
+                title: t.to_string(),
+                task_date: date.to_string(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn build_sync_text_generates_tasks_and_truncates() {
+        let tasks = make_items(
+            &["任務編號 1 的內容", "任務編號 2 的內容", "任務編號 3 的內容", "任務編號 4 的內容", "任務編號 5 的內容"],
+            "2026-07-09",
+        );
+
+        let (text, summarized) = build_sync_text(&tasks);
+        assert!(!summarized, "5 short tasks should not require summarization");
+        assert!(
+            text.contains("=== 聯絡簿"),
+            "should have header with date"
+        );
+        assert!(text.contains("7/9 (四)"), "should show date with weekday");
+        assert!(text.contains("任務編號 1"), "should contain first task");
+        assert!(text.contains("任務編號 5"), "should contain last task");
+
+        let long_items: Vec<SyncTaskItem> = (1..=20)
+            .map(|i| SyncTaskItem {
+                title: format!(
+                    "這是一個非常長的任務敘述，包含了很多詳細的說明文字，編號是 {}，\
+                     目的是要測試當聯絡簿內容過多時，系統能否正確偵測到長度超過 LINE \
+                     API 允許的 300 字上限，並自動切換為摘要模式",
+                    i
+                ),
+                task_date: "2026-07-09".to_string(),
+            })
+            .collect();
+
+        let (short_text, was_summarized) = build_sync_text(&long_items);
+        assert!(
+            was_summarized,
+            "20 long tasks should trigger summarization"
+        );
+        assert!(
+            short_text.len() <= LINE_RICHMENU_MAX_ACTION_TEXT,
+            "summarized text should not exceed max length"
+        );
+    }
+
+    #[test]
+    fn build_sync_text_handles_empty_input() {
+        let empty: Vec<SyncTaskItem> = vec![];
+        let (text, summarized) = build_sync_text(&empty);
+        assert!(!summarized);
+        assert_eq!(text, "=== 聯絡簿 ===\n");
+    }
+
+    #[test]
+    fn build_sync_text_shows_date_in_header_when_same_date() {
+        let tasks = make_items(
+            &["交回條", "帶餐具"],
+            "2026-07-10",
+        );
+        let (text, _) = build_sync_text(&tasks);
+        assert!(text.contains("=== 聯絡簿 (7/10 (五)) ==="));
+        assert!(text.contains("1. 交回條"));
+        assert!(text.contains("2. 帶餐具"));
+    }
+
+    #[test]
+    fn build_sync_text_groups_by_date_when_different_dates() {
+        let tasks = vec![
+            SyncTaskItem { title: "交回條".into(), task_date: "2026-07-09".into() },
+            SyncTaskItem { title: "帶餐具".into(), task_date: "2026-07-09".into() },
+            SyncTaskItem { title: "買文具".into(), task_date: "2026-07-10".into() },
+        ];
+        let (text, _) = build_sync_text(&tasks);
+        assert!(text.contains("=== 聯絡簿 ==="), "no date in header when dates differ");
+        assert!(text.contains("7/9 (四)"), "should have first date group");
+        assert!(text.contains("7/10 (五)"), "should have second date group");
+        assert!(text.contains("1. 交回條"));
+        assert!(text.contains("2. 帶餐具"));
+        assert!(text.contains("3. 買文具"));
+    }
+
+    #[test]
+    fn mask_sensitive_and_is_masked_work_correctly() {
+        assert!(is_masked("abcd****"), "masked value should be detected");
+        assert!(!is_masked(""), "empty string is not masked");
+        assert!(!is_masked("realtoken123"), "real value without ****");
+
+        let result = serde_json::to_string(&ClassroomSummary {
+            id: 1,
+            name: "test".into(),
+            line_enabled: true,
+            line_channel_access_token: "my-secret-token-here".into(),
+            line_channel_secret: "my-secret".into(),
+            line_rich_menu_id: "rich123".into(),
+        })
+        .expect("serialize classroom summary");
+
+        assert!(
+            result.contains("my-s****"),
+            "token should be masked: {result}"
+        );
+        assert!(
+            result.contains("my-s****"),
+            "secret should be masked: {result}"
+        );
+        assert!(!result.contains("my-secret-token-here"), "full token hidden");
+        assert!(!result.contains("my-secret"), "full secret hidden");
+    }
+
+    #[test]
+    fn init_database_applies_line_settings_migration() {
+        let db_path = make_temp_db_path();
+        init_database(&db_path).expect("init should apply all migrations");
+
+        let conn = Connection::open(&db_path).expect("open sqlite database");
+        let col_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(1) FROM pragma_table_info('classrooms') \
+                 WHERE name IN ('line_enabled', 'line_channel_access_token', \
+                                'line_channel_secret', 'line_rich_menu_id')",
+                [],
+                |row| row.get(0),
+            )
+            .expect("query line columns");
+        assert_eq!(col_count, 4, "all 4 LINE columns should exist");
 
         let _ = fs::remove_file(db_path);
     }

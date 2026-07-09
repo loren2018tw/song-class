@@ -23,6 +23,17 @@ export interface StudentSession {
 export interface ClassroomSummary {
   id: number;
   name: string;
+  line_enabled: boolean;
+  line_channel_access_token: string;
+  line_channel_secret: string;
+  line_rich_menu_id: string;
+}
+
+export interface UpdateClassroomRequest {
+  name?: string;
+  line_enabled?: boolean;
+  line_channel_access_token?: string;
+  line_channel_secret?: string;
 }
 
 export interface ClassroomStudent {

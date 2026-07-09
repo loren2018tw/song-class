@@ -16,6 +16,7 @@ song-class 是一個以「課堂即時互動」為核心的跨平台教學系統
 - 教師端白板與學生端即時白板
 - 即時廣播教師畫面到學生端
 - 聯絡簿及作業繳交管理
+- LINE 官方帳號 rich menu 同步（每班可獨立設定，手動一鍵同步）
 - Teacher/Student 雙端即時通道（Realtime Channel）
 - 即時問答互動
 - 教師端與 Web 端共用 UI 元件，降低重複開發成本
@@ -87,6 +88,41 @@ pnpm tauri dev
 ```bash
 pnpm tauri build
 ```
+
+## LINE 官方帳號同步設定
+
+### 前置準備
+
+1. 在 [LINE Developers Console](https://developers.line.biz/console/) 建立或選取一個 Messaging API channel。
+2. 取得 **Channel Access Token**（長期權杖）與 **Channel Secret**。
+3. 將該 channel 設定為可使用 rich menu。
+
+### 教師操作步驟
+
+1. 在主控台「班級編輯畫面」點選班級的「編輯」按鈕。
+2. 在彈出對話框的 **LINE 官方帳號設定** 區塊：
+   - 開啟「啟用 LINE 同步」開關。
+   - 填入 Channel Access Token 與 Channel Secret。
+   - 點選「儲存」。
+3. 進入該班的「聯絡簿管理」模組。
+4. 確認當日聯絡簿內容已編輯完成。
+5. 點選工具列上的「同步到官方帳號」按鈕。
+6. 等待同步完成，系統會顯示成功或失敗訊息。
+
+### 同步行為說明
+
+- 每次同步會以**當下畫面顯示的聯絡簿任務**作為同步來源。
+- 系統會自動檢查該班是否已有 rich menu；若無則自動建立。
+- rich menu 的「聯絡簿」按鈕使用固定訊息動作，內容為最新的同步文字。
+- 若同步文字超過 300 字，系統會自動摘要並提示教師。
+- 若 rich menu 失效，系統會自動重建並回填新的 richMenuId。
+- 同步不依賴 webhook 或外部常駐服務。
+
+### 注意事項
+
+- Token 與 Secret 為敏感資訊，讀取 API 時會自動遮罩顯示。
+- 每班可獨立設定不同的 LINE 官方帳號。
+- 若需關閉 LINE 同步功能，可在班級設定中關閉「啟用 LINE 同步」開關。
 
 ## 建議開發環境
 

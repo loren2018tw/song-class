@@ -33,6 +33,19 @@ const tasks = ref<ContactBookTask[]>([]);
 const submissionByTask = reactive(new Map<number, TaskSubmissionsPayload>());
 const loadingSubmissionsByTask = reactive(new Map<number, boolean>());
 
+const syncing = ref(false);
+const syncSnackbar = ref(false);
+const syncMessage = ref("");
+const syncSuccess = ref(false);
+const syncSummarized = ref(false);
+
+interface SyncToLineResponse {
+  success: boolean;
+  rich_menu_id: string;
+  message: string;
+  summarized: boolean;
+}
+
 const taskForm = reactive({
   task_date: selectedDate.value,
   title: "",
@@ -119,6 +132,49 @@ function openDeleteTaskDialog(task: ContactBookTask) {
 function closeDeleteTaskDialog() {
   deleteDialogVisible.value = false;
   taskToDelete.value = null;
+}
+
+async function syncToLine() {
+  if (!props.classroomId) {
+    syncMessage.value = "請先選擇班級";
+    syncSuccess.value = false;
+    syncSummarized.value = false;
+    syncSnackbar.value = true;
+    return;
+  }
+
+  const syncTasks = tasks.value
+    .filter((t) => t.show_in_contact_book)
+    .map((t) => ({ title: t.title, task_date: t.task_date }));
+  if (syncTasks.length === 0) {
+    syncMessage.value = "目前沒有可同步的聯絡簿內容";
+    syncSuccess.value = false;
+    syncSummarized.value = false;
+    syncSnackbar.value = true;
+    return;
+  }
+
+  syncing.value = true;
+  try {
+    const resp = await apiRequest<SyncToLineResponse>(
+      `/api/contact-book/sync-to-line/${props.classroomId}`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ tasks: syncTasks }),
+      },
+    );
+    syncSuccess.value = resp.success;
+    syncMessage.value = resp.message;
+    syncSummarized.value = resp.summarized;
+  } catch (error) {
+    syncSuccess.value = false;
+    syncMessage.value = `同步失敗: ${String(error)}`;
+    syncSummarized.value = false;
+  } finally {
+    syncing.value = false;
+    syncSnackbar.value = true;
+  }
 }
 
 function buildListQuery() {
@@ -411,6 +467,16 @@ onMounted(async () => {
         >
           新增任務
         </v-btn>
+
+        <v-btn
+          color="success"
+          prepend-icon="mdi-sync"
+          :loading="syncing"
+          :disabled="syncing || !props.classroomId"
+          @click="syncToLine"
+        >
+          同步到官方帳號
+        </v-btn>
       </div>
 
       <v-progress-linear v-if="loadingTasks" indeterminate color="primary" />
@@ -629,6 +695,19 @@ onMounted(async () => {
       </v-card-actions>
     </v-card>
   </v-dialog>
+
+  <v-snackbar
+    v-model="syncSnackbar"
+    :color="syncSuccess ? 'success' : 'error'"
+    :timeout="4000"
+    location="top"
+  >
+    <v-icon start :icon="syncSuccess ? 'mdi-check-circle' : 'mdi-alert-circle'" />
+    {{ syncMessage }}
+    <template #actions>
+      <v-btn variant="text" @click="syncSnackbar = false">關閉</v-btn>
+    </template>
+  </v-snackbar>
 </template>
 
 <style scoped>

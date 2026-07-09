@@ -47,6 +47,21 @@ const viewMode = ref<ConsoleViewMode>("main");
 const classRenameDialogVisible = ref(false);
 const classRenameDraft = ref("");
 const classRenameTarget = ref<ClassroomSummary | null>(null);
+const lineEnabled = ref(false);
+const lineTokenDraft = ref("");
+const lineSecretDraft = ref("");
+const richMenuDialogVisible = ref(false);
+const lineRichMenus = ref<LineRichMenuItem[]>([]);
+const loadingRichMenus = ref(false);
+const deletingRichMenuId = ref<string | null>(null);
+
+interface LineRichMenuItem {
+  rich_menu_id: string;
+  name: string;
+  chat_bar_text: string;
+  selected: boolean;
+}
+
 const warningDialogVisible = ref(false);
 const warningMessage = ref("");
 const confirmDialogVisible = ref(false);
@@ -421,7 +436,44 @@ async function createClassroom() {
 function openClassRenameDialog(classroom: ClassroomSummary) {
   classRenameTarget.value = classroom;
   classRenameDraft.value = classroom.name;
+  lineEnabled.value = classroom.line_enabled;
+  lineTokenDraft.value = classroom.line_channel_access_token;
+  lineSecretDraft.value = classroom.line_channel_secret;
   classRenameDialogVisible.value = true;
+}
+
+async function openRichMenuDialog() {
+  if (!classRenameTarget.value) return;
+  richMenuDialogVisible.value = true;
+  loadingRichMenus.value = true;
+  lineRichMenus.value = [];
+  try {
+    const menus = await apiGet<LineRichMenuItem[]>(
+      `/api/contact-book/line-richmenus/${classRenameTarget.value.id}`,
+    );
+    lineRichMenus.value = menus;
+  } catch (error) {
+    actionError.value = `查詢 Rich Menu 失敗: ${String(error)}`;
+  } finally {
+    loadingRichMenus.value = false;
+  }
+}
+
+async function deleteLineRichMenu(richMenuId: string) {
+  if (!classRenameTarget.value) return;
+  deletingRichMenuId.value = richMenuId;
+  try {
+    await apiDelete(
+      `/api/contact-book/line-richmenus/${classRenameTarget.value.id}/${richMenuId}`,
+    );
+    lineRichMenus.value = lineRichMenus.value.filter(
+      (m) => m.rich_menu_id !== richMenuId,
+    );
+  } catch (error) {
+    actionError.value = `刪除 Rich Menu 失敗: ${String(error)}`;
+  } finally {
+    deletingRichMenuId.value = null;
+  }
 }
 
 async function confirmClassRename() {
@@ -430,9 +482,17 @@ async function confirmClassRename() {
   }
 
   try {
+    const body: Record<string, unknown> = { name: classRenameDraft.value };
+    body.line_enabled = lineEnabled.value;
+    if (lineTokenDraft.value) {
+      body.line_channel_access_token = lineTokenDraft.value;
+    }
+    if (lineSecretDraft.value) {
+      body.line_channel_secret = lineSecretDraft.value;
+    }
     const state = await apiPatch<ClassroomStatePayload>(
       `/api/classrooms/${classRenameTarget.value.id}`,
-      { name: classRenameDraft.value },
+      body,
     );
     applyClassroomState(state);
     appendLog(`rename_classroom: ${classRenameTarget.value.id}`);
@@ -784,9 +844,9 @@ onBeforeUnmount(() => {
       </v-col>
     </v-row>
 
-    <v-dialog v-model="classRenameDialogVisible" max-width="520">
+    <v-dialog v-model="classRenameDialogVisible" max-width="560">
       <v-card>
-        <v-card-title>編輯班級名稱</v-card-title>
+        <v-card-title>班級設定</v-card-title>
         <v-card-text>
           <v-text-field
             v-model="classRenameDraft"
@@ -795,12 +855,98 @@ onBeforeUnmount(() => {
             density="comfortable"
             hide-details="auto"
           />
+          <v-divider class="my-4" />
+          <div class="text-subtitle-2 mb-2 text-medium-emphasis">
+            LINE 官方帳號設定
+          </div>
+          <v-switch
+            v-model="lineEnabled"
+            label="啟用 LINE 同步"
+            color="primary"
+            density="compact"
+            hide-details
+            class="mb-2"
+          />
+          <v-text-field
+            v-model="lineTokenDraft"
+            label="Channel Access Token"
+            variant="outlined"
+            density="comfortable"
+            hint="輸入新值以覆寫，留空保留原值"
+            persistent-hint
+            :type="lineTokenDraft.includes('****') ? 'password' : 'text'"
+          />
+          <v-text-field
+            v-model="lineSecretDraft"
+            label="Channel Secret"
+            variant="outlined"
+            density="comfortable"
+            hint="輸入新值以覆寫，留空保留原值"
+            persistent-hint
+            :type="lineSecretDraft.includes('****') ? 'password' : 'text'"
+          />
+          <v-btn
+            variant="outlined"
+            size="small"
+            color="secondary"
+            prepend-icon="mdi-menu-open"
+            class="mt-2"
+            @click="openRichMenuDialog"
+            >管理 Rich Menu</v-btn
+          >
         </v-card-text>
         <v-card-actions class="justify-end">
           <v-btn variant="text" @click="classRenameDialogVisible = false"
             >取消</v-btn
           >
           <v-btn color="primary" @click="confirmClassRename">儲存</v-btn>
+        </v-card-actions>
+      </v-card>
+    </v-dialog>
+
+    <v-dialog v-model="richMenuDialogVisible" max-width="600">
+      <v-card>
+        <v-card-title>Rich Menu 管理</v-card-title>
+        <v-card-text>
+          <v-alert
+            v-if="actionError"
+            type="error"
+            closable
+            class="mb-3"
+            @click:close="actionError = ''"
+          >
+            {{ actionError }}
+          </v-alert>
+          <v-progress-linear v-if="loadingRichMenus" indeterminate class="mb-3" />
+          <div v-else-if="lineRichMenus.length === 0" class="text-medium-emphasis">
+            目前沒有 Rich Menu
+          </div>
+          <v-list v-else lines="two">
+            <v-list-item
+              v-for="menu in lineRichMenus"
+              :key="menu.rich_menu_id"
+              :title="menu.name || '(未命名)'"
+              :subtitle="`${menu.rich_menu_id}${
+                menu.selected ? ' (預設)' : ''
+              }`"
+            >
+              <template #append>
+                <v-btn
+                  variant="text"
+                  color="error"
+                  icon="mdi-delete"
+                  :loading="deletingRichMenuId === menu.rich_menu_id"
+                  :disabled="deletingRichMenuId !== null"
+                  @click="deleteLineRichMenu(menu.rich_menu_id)"
+                />
+              </template>
+            </v-list-item>
+          </v-list>
+        </v-card-text>
+        <v-card-actions class="justify-end">
+          <v-btn variant="text" @click="richMenuDialogVisible = false"
+            >關閉</v-btn
+          >
         </v-card-actions>
       </v-card>
     </v-dialog>
